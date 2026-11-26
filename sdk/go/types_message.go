@@ -21,10 +21,12 @@ type SendTextRequest struct {
 	Mentions []string `json:"mentions,omitempty"`
 	// LinkPreview controls the URL preview. False suppresses it on both engines. Otherwise the
 	// engines differ: whatsapp-web.js builds one in-page by default, while on Baileys a preview is
-	// OPT-IN — it needs true, because generating one is a blocking outbound fetch per URL.
+	// OPT-IN — it needs true, because generating one is a blocking outbound fetch of the
+	// first URL in the text. Unset, the session's linkPreview config applies when one is set (OpenWA
+	// 0.30.3 or later).
 	LinkPreview *bool `json:"linkPreview,omitempty"`
-	// CustomLinkPreview attaches a preview you supply instead of one fetched from the URL. Nothing is
-	// fetched, so it works even for a URL the gateway cannot reach. Baileys only — whatsapp-web.js
+	// CustomLinkPreview attaches a preview you supply instead of one fetched from the URL. The page is
+	// not fetched, so it works even for a URL the gateway cannot reach. Baileys only — whatsapp-web.js
 	// takes a boolean and answers 501. Cannot be combined with LinkPreview=false.
 	CustomLinkPreview *CustomLinkPreview `json:"customLinkPreview,omitempty"`
 	// QuotedMessageID quotes an earlier message, turning this send into a reply. Engine-specific:
@@ -69,7 +71,8 @@ type SendAudioRequest struct {
 	Mentions []string `json:"mentions,omitempty"`
 }
 
-// SendLocationRequest sends a location pin. ChatID/Latitude/Longitude required.
+// SendLocationRequest sends a location pin. ChatID/Latitude/Longitude required. A coordinate left
+// unset is sent as 0, a real place, and the gateway sends a pin there, so always set both.
 type SendLocationRequest struct {
 	ChatID      string  `json:"chatId"`
 	Latitude    float64 `json:"latitude"`
@@ -295,25 +298,29 @@ type MessageLocation struct {
 // ChatHistoryMessage is a message read live from WhatsApp by Messages.History —
 // the richer engine payload, differently shaped from MessageRecord.
 type ChatHistoryMessage struct {
-	ID                string          `json:"id"`
-	From              string          `json:"from"`
-	To                string          `json:"to"`
-	ChatID            string          `json:"chatId"`
-	Body              string          `json:"body"`
-	Type              MessageType     `json:"type"`
-	Timestamp         int64           `json:"timestamp"`
-	FromMe            bool            `json:"fromMe"`
-	IsGroup           bool            `json:"isGroup"`
-	IsStatusBroadcast bool            `json:"isStatusBroadcast,omitempty"`
-	Kind              ChatKind        `json:"kind"`
-	EphemeralDuration int             `json:"ephemeralDuration,omitempty"`
-	Author            string          `json:"author,omitempty"`
-	MentionedIDs      []string        `json:"mentionedIds,omitempty"`
-	Call              *MessageCall    `json:"call,omitempty"`
-	IsLidSender       bool            `json:"isLidSender,omitempty"`
-	SenderPhone       *string         `json:"senderPhone,omitempty"`
-	Contact           *MessageContact `json:"contact,omitempty"`
-	BackgroundColor   string          `json:"backgroundColor,omitempty"`
+	ID                string      `json:"id"`
+	From              string      `json:"from"`
+	To                string      `json:"to"`
+	ChatID            string      `json:"chatId"`
+	Body              string      `json:"body"`
+	Type              MessageType `json:"type"`
+	Timestamp         int64       `json:"timestamp"`
+	FromMe            bool        `json:"fromMe"`
+	IsGroup           bool        `json:"isGroup"`
+	IsStatusBroadcast bool        `json:"isStatusBroadcast,omitempty"`
+	Kind              ChatKind    `json:"kind"`
+	EphemeralDuration int         `json:"ephemeralDuration,omitempty"`
+	// IsForwarded and ForwardingScore: the score is a sender-written unsigned 32-bit value, held as
+	// 64-bit so it cannot overflow.
+	IsForwarded     bool            `json:"isForwarded,omitempty"`
+	ForwardingScore int64           `json:"forwardingScore,omitempty"`
+	Author          string          `json:"author,omitempty"`
+	MentionedIDs    []string        `json:"mentionedIds,omitempty"`
+	Call            *MessageCall    `json:"call,omitempty"`
+	IsLidSender     bool            `json:"isLidSender,omitempty"`
+	SenderPhone     *string         `json:"senderPhone,omitempty"`
+	Contact         *MessageContact `json:"contact,omitempty"`
+	BackgroundColor string          `json:"backgroundColor,omitempty"`
 	// Pointer because font index 0 is a real style, so a value type could not tell it from absent.
 	// Matches StatusRecord.Font, which carries the same wire field.
 	Font          *int              `json:"font,omitempty"`
@@ -386,6 +393,22 @@ type ReactionSender struct {
 type ReactionRecord struct {
 	Emoji   string           `json:"emoji"`
 	Senders []ReactionSender `json:"senders"`
+}
+
+// MessageReceiptParticipant is one recipient within a MessageReceiptsResponse.
+type MessageReceiptParticipant struct {
+	Participant string `json:"participant"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+// MessageReceiptsResponse groups per-participant delivery, read, and played receipts.
+type MessageReceiptsResponse struct {
+	Delivery          []MessageReceiptParticipant `json:"delivery"`
+	DeliveryRemaining *int                        `json:"deliveryRemaining,omitempty"`
+	Read              []MessageReceiptParticipant `json:"read"`
+	ReadRemaining     *int                        `json:"readRemaining,omitempty"`
+	Played            []MessageReceiptParticipant `json:"played"`
+	PlayedRemaining   *int                        `json:"playedRemaining,omitempty"`
 }
 
 // BulkMediaContent is a per-item media block for a bulk send. It mirrors the

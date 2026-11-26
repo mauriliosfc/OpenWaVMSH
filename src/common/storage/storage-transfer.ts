@@ -1,7 +1,13 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import * as tar from 'tar-stream';
 import { createGunzip, createGzip } from 'zlib';
 import { Readable, PassThrough, Transform, pipeline } from 'stream';
-import { LoggerService } from '../services/logger.service';
+import { pipeline as pipelinePromise } from 'stream/promises';
+import { ServiceUnavailableException, StreamableFile } from '@nestjs/common';
+import type { Response } from 'express';
+import { createLogger, LoggerService } from '../services/logger.service';
 import { positiveIntFromEnv } from '../utils/env-int';
 
 /** Per-entry buffer cap for an import (200 MiB — 4× the inbound media cap). Bounds a decompression bomb. */
@@ -38,6 +44,46 @@ export function isMissingObjectError(error: unknown): boolean {
 export interface ExportFileSource {
   stream: Readable;
   size?: number;
+}
+
+const storedFileLogger = createLogger('StoredFile');
+
+/** Seconds a download refused for a full pool is told to wait: a place frees as soon as any open download ends. */
+export const DOWNLOADS_BUSY_RETRY_AFTER_SECONDS = 1;
+
+/** A download refused at once because the S3 download pool is full. */
+export class DownloadsBusyException extends ServiceUnavailableException {
+  constructor() {
+    super('Too many media downloads are in progress; retry shortly');
+  }
+}
+
+/** For a download route's `.catch`: a refusal for a full pool goes out with a Retry-After. Every error is rethrown. */
+export function retryAfterWhenBusy(res: Response): (error: unknown) => never {
+  return error => {
+    if (error instanceof DownloadsBusyException) res.set('Retry-After', String(DOWNLOADS_BUSY_RETRY_AFTER_SECONDS));
+    throw error;
+  };
+}
+
+/**
+ * Answer a stored file as an attachment, streamed rather than read into memory first. Content-Length
+ * goes out only when the store reported a size. A read that fails before the first byte drops the
+ * media headers and answers the JSON 500 a failed whole-file read used to; one that fails after it
+ * cuts the connection, since the status line has gone out and a short body must not pass for the file.
+ */
+export function storedFileAttachment(res: Response, source: ExportFileSource, mimetype: string): StreamableFile {
+  res.set({ 'Content-Type': mimetype, 'X-Content-Type-Options': 'nosniff', 'Content-Disposition': 'attachment' });
+  const file = new StreamableFile(source.stream, source.size === undefined ? {} : { length: source.size });
+  const cutConnection = file.errorHandler;
+  return file.setErrorHandler((error, response) => {
+    if (response.destroyed || response.headersSent) return cutConnection(error, response);
+    storedFileLogger.error('Reading a stored file failed before any of it was sent', String(error));
+    res.removeHeader('Content-Type');
+    res.removeHeader('Content-Disposition');
+    res.removeHeader('Content-Length');
+    res.status(500).json({ statusCode: 500, message: 'Internal server error' });
+  });
 }
 
 type TarPack = ReturnType<typeof tar.pack>;
@@ -97,7 +143,7 @@ export async function createExportStream(
   return output;
 }
 
-function enforceSize(file: string, size: number | undefined): Transform {
+function enforceSize(file: string, size: number | undefined, onRead: (bytes: number) => void): Transform {
   let seen = 0;
   const mismatch = (): Error => new Error(`Export failed: ${file} changed size while being read (expected ${size})`);
   return new Transform({
@@ -106,7 +152,9 @@ function enforceSize(file: string, size: number | undefined): Transform {
       callback(size !== undefined && seen > size ? mismatch() : null, chunk);
     },
     flush(callback) {
-      callback(size !== undefined && seen < size ? mismatch() : null);
+      if (size !== undefined && seen < size) return callback(mismatch());
+      onRead(seen);
+      callback();
     },
   });
 }
@@ -124,6 +172,7 @@ function writeEntry(
   header: { name: string; mode: number; mtime: Date },
   size: number | undefined,
   output: PassThrough,
+  logger: LoggerService,
   done: () => void,
 ): void {
   if (size !== undefined) {
@@ -132,13 +181,33 @@ function writeEntry(
     source.pipe(sink);
     return;
   }
-  const chunks: Buffer[] = [];
-  source.on('data', (chunk: Buffer) => chunks.push(chunk));
-  source.on('end', () => {
-    // The pack is gone once the output closed, and adding an entry to a destroyed pack throws.
-    if (output.destroyed) return;
-    pack.entry(header, Buffer.concat(chunks), () => done()).on('error', () => undefined);
-  });
+  void (async () => {
+    let spillDir: string | undefined;
+    try {
+      spillDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'owa-tar-exp-'));
+      const spillFile = path.join(spillDir, 'entry.bin');
+      await pipelinePromise(source, fs.createWriteStream(spillFile));
+      if (output.destroyed) {
+        done();
+        return;
+      }
+      const { size: measuredSize } = await fs.promises.stat(spillFile);
+      const sink = pack.entry({ ...header, size: measuredSize }, () => done());
+      sink.on('error', () => undefined);
+      await pipelinePromise(fs.createReadStream(spillFile), sink);
+    } catch (error) {
+      if (!output.destroyed) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        logger.error(`Export failed buffering unsized entry: ${header.name}`, err.message);
+        output.destroy(err);
+      }
+      done();
+    } finally {
+      if (spillDir) {
+        await fs.promises.rm(spillDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+  })();
 }
 
 async function appendEntries(
@@ -164,8 +233,6 @@ async function appendEntries(
       continue;
     }
     const { stream, size } = source;
-    exportedBytes += size ?? 0;
-    if ((size ?? 0) > largest.size) largest = { file, size: size ?? 0 };
     // The output closes early when the archive fails or the consumer goes away: stop reading files.
     // Checked synchronously before waiting, so a 'close' that already fired cannot be missed.
     if (output.destroyed) {
@@ -176,18 +243,26 @@ async function appendEntries(
     // its header. A file rewritten between open and read does that, so the length is checked here and
     // a mismatch fails the export like a read error, naming the file, before the sink sees the extra
     // byte or the early end. pipeline() also forwards a source error, which pipe() does not.
-    const entry = pipeline(stream, enforceSize(file, size), err => {
-      if (!err || output.destroyed) return;
-      logger.error(`Export failed reading file: ${file}`, String(err));
-      output.destroy(err);
-    });
+    // The import-limit warnings below count the bytes read, since a backend may not report a length.
+    const entry = pipeline(
+      stream,
+      enforceSize(file, size, bytes => {
+        exportedBytes += bytes;
+        if (bytes > largest.size) largest = { file, size: bytes };
+      }),
+      err => {
+        if (!err || output.destroyed) return;
+        logger.error(`Export failed reading file: ${file}`, String(err));
+        output.destroy(err);
+      },
+    );
     await new Promise<void>(resolve => {
       const done = (): void => {
         output.removeListener('close', done);
         resolve();
       };
       output.on('close', done);
-      writeEntry(pack, entry, { name: file, mode: 0o644, mtime: new Date() }, size, output, done);
+      writeEntry(pack, entry, { name: file, mode: 0o644, mtime: new Date() }, size, output, logger, done);
     });
     if (output.destroyed) {
       stream.destroy();
@@ -227,15 +302,39 @@ async function appendEntries(
 // re-running an import is safe (putFile overwrites). A staging-dir + atomic promote would make it
 // transactional, but is out of scope here. Resolves with how many entries were written and how many
 // putFile refused, so a caller can tell an import that wrote nothing from an empty archive.
+export interface ImportStreamOptions {
+  putStream?: (filePath: string, stream: Readable, sizeBytes: number) => Promise<void>;
+}
+
 export async function importFromStream(
   inputStream: Readable,
   putFile: (filePath: string, data: Buffer) => Promise<void>,
   logger: LoggerService,
+  options?: ImportStreamOptions,
 ): Promise<{ imported: number; failed: number }> {
   let importedCount = 0;
   let failedCount = 0;
   let entryCount = 0;
   let totalBytes = 0;
+  let tmpEntrySeq = 0;
+  let activeWriteStream: fs.WriteStream | null = null;
+  let activeWriteClose: Promise<void> | null = null;
+  let activeUpload: Promise<unknown> | null = null;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-tar-imp-'));
+  const cleanupTmpDir = (): Promise<void> => {
+    const pending: Promise<unknown>[] = [];
+    if (activeWriteStream) {
+      activeWriteStream.destroy();
+    }
+    if (activeWriteClose) {
+      pending.push(activeWriteClose);
+    }
+    if (activeUpload) {
+      pending.push(activeUpload);
+    }
+    const remove = () => fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+    return pending.length === 0 ? remove() : Promise.allSettled(pending).then(remove);
+  };
   const maxEntryBytes = positiveIntFromEnv('STORAGE_IMPORT_MAX_BYTES', DEFAULT_IMPORT_MAX_BYTES);
   const maxEntries = positiveIntFromEnv('STORAGE_IMPORT_MAX_ENTRIES', DEFAULT_IMPORT_MAX_ENTRIES);
   const maxTotalBytes = positiveIntFromEnv('STORAGE_IMPORT_MAX_TOTAL_BYTES', DEFAULT_IMPORT_MAX_TOTAL_BYTES);
@@ -255,6 +354,7 @@ export async function importFromStream(
       gunzip.destroy();
       // Destroying the input mid-pipe stops the source; without an error arg it emits no 'error'.
       inputStream.destroy();
+      void cleanupTmpDir();
       // The counts reached so far ride on the rejection for the caller's audit row. A lower bound: a
       // putFile already in flight when a gzip or input error lands can still complete afterwards.
       reject(Object.assign(err, { imported: importedCount, failed: failedCount }));
@@ -273,6 +373,8 @@ export async function importFromStream(
     });
 
     extract.on('entry', (header, stream, next) => {
+      // Ignore late entry stream errors if extraction is aborted mid-entry.
+      stream.on('error', () => undefined);
       if (settled) {
         stream.resume();
         return;
@@ -294,9 +396,30 @@ export async function importFromStream(
       // segment, and on S3 it would become part of the object key.
       const key = header.name.replace(/^(?:\.\/)+/, '');
 
-      const chunks: Buffer[] = [];
+      const tmpEntryPath = path.join(tmpDir, `entry-${++tmpEntrySeq}`);
+      const ws = fs.createWriteStream(tmpEntryPath);
+      activeWriteStream = ws;
+      const wsClosed = new Promise<void>(closeResolve => {
+        ws.once('close', () => {
+          if (activeWriteStream === ws) {
+            activeWriteStream = null;
+          }
+          if (activeWriteClose === wsClosed) {
+            activeWriteClose = null;
+          }
+          closeResolve();
+        });
+      });
+      activeWriteClose = wsClosed;
       let entryBytes = 0;
       let entryAborted = false;
+
+      ws.on('error', (err: Error) => {
+        if (entryAborted || settled) return;
+        entryAborted = true;
+        stream.resume();
+        fail(err);
+      });
 
       stream.on('data', (chunk: Buffer) => {
         if (entryAborted || settled) return;
@@ -304,6 +427,7 @@ export async function importFromStream(
         totalBytes += chunk.length;
         if (entryBytes > maxEntryBytes) {
           entryAborted = true;
+          ws.destroy();
           stream.resume(); // drain the remainder so the source can end
           fail(
             new Error(
@@ -313,31 +437,49 @@ export async function importFromStream(
         } else if (totalBytes > maxTotalBytes) {
           // The entry that crosses the cap is dropped, so no import writes more than maxTotalBytes.
           entryAborted = true;
+          ws.destroy();
           stream.resume();
           fail(
             new Error(
               `Import aborted: archive exceeds the ${maxTotalBytes}-byte total cap (STORAGE_IMPORT_MAX_TOTAL_BYTES)`,
             ),
           );
-        } else {
-          chunks.push(chunk);
+        } else if (!ws.write(chunk)) {
+          stream.pause();
+          ws.once('drain', () => {
+            if (!settled && !entryAborted) stream.resume();
+          });
         }
       });
 
       stream.on('end', () => {
         if (entryAborted || settled) return;
-        const data = Buffer.concat(chunks);
-        putFile(key, data)
-          .then(() => {
-            importedCount++;
-            logger.debug(`Imported file: ${key}`);
-            next();
-          })
-          .catch((error: unknown) => {
-            failedCount++;
-            logger.error(`Failed to import file: ${key}`, String(error));
-            next();
-          });
+        ws.once('finish', () => {
+          if (entryAborted || settled) return;
+          const upload = options?.putStream
+            ? (() => {
+                const rs = fs.createReadStream(tmpEntryPath);
+                return options.putStream(key, rs, entryBytes).finally(() => rs.destroy());
+              })()
+            : fs.promises.readFile(tmpEntryPath).then(data => putFile(key, data));
+
+          const uploadTask = upload
+            .finally(() => fs.promises.unlink(tmpEntryPath).catch(() => undefined))
+            .then(() => {
+              if (activeUpload === uploadTask) activeUpload = null;
+              importedCount++;
+              logger.debug(`Imported file: ${key}`);
+              if (!settled) next();
+            })
+            .catch((error: unknown) => {
+              if (activeUpload === uploadTask) activeUpload = null;
+              failedCount++;
+              logger.error(`Failed to import file: ${key}`, String(error));
+              if (!settled) next();
+            });
+          activeUpload = uploadTask;
+        });
+        ws.end();
       });
       stream.resume();
     });
@@ -345,8 +487,10 @@ export async function importFromStream(
     extract.on('finish', () => {
       if (settled) return;
       settled = true;
-      logger.log(`Import completed: ${importedCount} files, ${failedCount} failed`);
-      resolve({ imported: importedCount, failed: failedCount });
+      void cleanupTmpDir().then(() => {
+        logger.log(`Import completed: ${importedCount} files, ${failedCount} failed`);
+        resolve({ imported: importedCount, failed: failedCount });
+      });
     });
 
     extract.on('error', (err: Error) => {

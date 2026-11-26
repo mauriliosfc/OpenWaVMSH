@@ -23,6 +23,7 @@ import { stripBase64DataUri } from '../../message/media-cap.util';
 // so MCP and REST enforce the same limits on the equivalent operations.
 export const GROUP_NAME_MAX_LENGTH = 100;
 export const GROUP_DESCRIPTION_MAX_LENGTH = 1024;
+export const GROUP_MEMBER_LABEL_MAX_LENGTH = 30;
 
 /**
  * Max participants accepted in one group-create or participant-batch request. The engine works the
@@ -109,6 +110,24 @@ export class GroupDescriptionDto {
   description!: string;
 }
 
+export class GroupMemberLabelDto {
+  @ApiProperty({
+    description:
+      "This account's label in the group, shown beside its name (may be empty to clear it). Counted in " +
+      'UTF-16 code units, so an emoji outside the Basic Multilingual Plane takes two of the 30.',
+    maxLength: GROUP_MEMBER_LABEL_MAX_LENGTH,
+    example: 'Site A Management',
+  })
+  @ToStrictString()
+  @IsString()
+  // Not @MaxLength: it counts an astral emoji once, while Baileys cuts the label with slice(0, 30), so a label
+  // it passes could be shortened behind a 200, mid-emoji. No `u` flag, so each match is one code unit.
+  @Matches(new RegExp(`^[\\s\\S]{0,${GROUP_MEMBER_LABEL_MAX_LENGTH}}$`), {
+    message: `label must be shorter than or equal to ${GROUP_MEMBER_LABEL_MAX_LENGTH} UTF-16 code units`,
+  })
+  label!: string;
+}
+
 export class JoinGroupDto {
   @ApiProperty({
     description: 'Group invite code (the token from a https://chat.whatsapp.com/<code> link)',
@@ -171,6 +190,7 @@ export class GroupSettingsDto {
   @ApiPropertyOptional({
     description:
       'Disappearing-messages timer in seconds; 0 disables. Known values: 86400 (24h), 604800 (7d), 7776000 (90d)',
+    type: 'integer',
     minimum: 0,
   })
   @ToStrictNumber()

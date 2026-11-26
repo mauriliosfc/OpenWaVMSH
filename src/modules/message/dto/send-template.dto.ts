@@ -9,9 +9,17 @@ import {
   MaxLength,
   IsBoolean,
   Validate,
+  Matches,
 } from 'class-validator';
 import { ToStrictArray, ToStrictBoolean, ToStrictString } from '../../../common/utils/strict-boolean';
-import { CHAT_ID_MAX_LENGTH, MENTIONS_DESCRIPTION, MENTIONS_MAX, MENTION_WID_MAX_LENGTH } from './send-message.dto';
+import {
+  CHAT_ID_MAX_LENGTH,
+  CHAT_JID_MESSAGE,
+  CHAT_JID_PATTERN,
+  MENTIONS_DESCRIPTION,
+  MENTIONS_MAX,
+  MENTION_WID_MAX_LENGTH,
+} from './send-message.dto';
 import { IsMentionWidConstraint } from './is-mention-wid.validator';
 
 export class SendTemplateMessageDto {
@@ -24,6 +32,7 @@ export class SendTemplateMessageDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiPropertyOptional({
@@ -77,7 +86,8 @@ export class SendTemplateMessageDto {
     description:
       'Controls the URL preview on the rendered body, with the same engine split as send-text: ' +
       'whatsapp-web.js builds one by default and `false` suppresses it, while on Baileys previews ' +
-      'are opt-in and only `true` attaches one.',
+      'are opt-in and only `true` attaches one. Unset, the `linkPreview` of the session config applies ' +
+      'when one is set.',
     example: false,
   })
   // Same guard as send-text: implicit conversion would turn the string "false" into true.

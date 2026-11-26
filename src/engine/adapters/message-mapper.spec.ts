@@ -6,6 +6,7 @@ import {
   POLL_TEXT_MAX_LENGTH,
   RawContactFields,
   RawMessageFields,
+  wwebjsBody,
 } from './message-mapper';
 
 describe('buildIncomingMessageBase', () => {
@@ -124,6 +125,28 @@ describe('buildIncomingMessageBase', () => {
     expect(r.mentionedIds).toEqual(['222@lid', '333@lid']);
   });
 
+  it('maps isForwarded and forwardingScore for a forwarded message', () => {
+    const r = buildIncomingMessageBase({ ...base, isForwarded: true, forwardingScore: 1 });
+    expect(r.isForwarded).toBe(true);
+    expect(r.forwardingScore).toBe(1);
+  });
+
+  it('omits forwardingScore when a forwarded message reports none (whatsapp-web.js defaults it to 0)', () => {
+    const r = buildIncomingMessageBase({ ...base, isForwarded: true, forwardingScore: 0 });
+    expect(r.isForwarded).toBe(true);
+    expect(r).not.toHaveProperty('forwardingScore');
+  });
+
+  it('omits the forward fields for a message that was not forwarded', () => {
+    for (const r of [
+      buildIncomingMessageBase(base),
+      buildIncomingMessageBase({ ...base, isForwarded: false, forwardingScore: 0 }),
+    ]) {
+      expect(r).not.toHaveProperty('isForwarded');
+      expect(r).not.toHaveProperty('forwardingScore');
+    }
+  });
+
   it('omits mentionedIds when absent or empty', () => {
     expect(buildIncomingMessageBase(base).mentionedIds).toBeUndefined();
     expect(buildIncomingMessageBase({ ...base, mentionedIds: [] }).mentionedIds).toBeUndefined();
@@ -169,6 +192,39 @@ describe('buildIncomingMessageBase', () => {
     const r = buildIncomingMessageBase({ ...base, title: 'Sample', productId: '2', orderId: '1' });
     expect(r.product).toBeUndefined();
     expect(r.order).toBeUndefined();
+  });
+});
+
+describe('wwebjsBody', () => {
+  const card = (name: string) => `BEGIN:VCARD\nVERSION:3.0\nFN:${name}\nEND:VCARD`;
+
+  it('joins the vCards of several contacts shared together, which arrive with no body', () => {
+    const shared = { type: 'multi_vcard', body: '', vCards: [card('Ana'), card('Budi')] };
+    expect(wwebjsBody(shared)).toBe(`${card('Ana')}\n${card('Budi')}`);
+    // WhatsApp Web holds the body of such a message as null, not as an empty string.
+    expect(wwebjsBody({ ...shared, body: null as unknown as string })).toBe(`${card('Ana')}\n${card('Budi')}`);
+  });
+
+  it('leaves every other body as it is', () => {
+    expect(wwebjsBody({ type: 'vcard', body: card('Ana'), vCards: [card('Ana')] })).toBe(card('Ana'));
+    expect(wwebjsBody({ type: 'chat', body: 'hi', vCards: [] })).toBe('hi');
+    expect(wwebjsBody({ type: 'multi_vcard', body: 'kept', vCards: [card('Ana')] })).toBe('kept');
+    expect(wwebjsBody({ type: 'multi_vcard', body: '' })).toBe('');
+  });
+
+  it('reaches the message a webhook and the message list carry', () => {
+    const r = buildIncomingMessageBase({
+      id: { _serialized: 'MSG1' },
+      from: '123@c.us',
+      to: 'me@c.us',
+      body: '',
+      type: 'multi_vcard',
+      vCards: [card('Ana'), card('Budi')],
+      timestamp: 1700000000,
+      fromMe: false,
+    });
+    expect(r.type).toBe('contact');
+    expect(r.body).toBe(`${card('Ana')}\n${card('Budi')}`);
   });
 });
 
@@ -261,6 +317,14 @@ describe('mapContactFields', () => {
       expect('verifiedName' in r).toBe(false);
       expect('name' in r).toBe(false);
       expect('labels' in r).toBe(false);
+    });
+
+    it('reads the id under the name a renamed WA Web build gives it', () => {
+      // WA Web 2.3000.x serializes a Wid as `$1` instead of `_serialized` (#747).
+      expect(mapContactFields({ id: { $1: '584145200715@c.us' }, number: '584145200715' }, true)).toEqual({
+        id: '584145200715@c.us',
+        number: '584145200715',
+      });
     });
 
     it('returns an empty object when nothing is set', () => {

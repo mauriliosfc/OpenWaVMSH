@@ -10,6 +10,7 @@ import type { ChatSummary } from '../../engine/interfaces/whatsapp-engine.interf
 import { ApiKeyRole, type ApiKey } from '../auth/entities/api-key.entity';
 import { REQUIRED_ROLE_KEY, UNSCOPED_KEY } from '../auth/decorators/auth.decorators';
 import { BadGatewayException, BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
+import { ENGINE_NOT_READY_409, SESSION_NOT_STARTED_400 } from '../../common/openapi/engine-status-responses';
 
 // POST /sessions declared a SessionResponseDto in its Swagger metadata but returned the raw
 // TypeORM entity, leaking internal columns (config, proxyUrl, proxyType) and the entity-only
@@ -369,6 +370,31 @@ describe('SessionController — muteChat', () => {
   });
 });
 
+// A session with no engine answers 400 "Session is not started"; a started one that is not ready answers the 409
+// these routes also list. A 400 described as "not ready" sends a client waiting for a session nobody started.
+describe('SessionController chat routes document the 400 of a session that is not started', () => {
+  const declared = (handler: keyof SessionController): Record<string, { description?: string }> =>
+    (Reflect.getMetadata(
+      'swagger/apiResponse',
+      Object.getOwnPropertyDescriptor(SessionControllerClass.prototype, handler)?.value as object,
+    ) ?? {}) as Record<string, { description?: string }>;
+
+  it.each([
+    'getGroups',
+    'getChats',
+    'markChatRead',
+    'markChatUnread',
+    'clearChatMessages',
+    'archiveChat',
+    'muteChat',
+    'pinChat',
+    'deleteChat',
+  ] as const)('%s', handler => {
+    expect(declared(handler)['400']?.description).toContain(SESSION_NOT_STARTED_400);
+    expect(declared(handler)['409']?.description).toBe(ENGINE_NOT_READY_409);
+  });
+});
+
 describe('SessionController findAll name filter', () => {
   const apiKey = { allowedSessions: ['sess-uuid-1'] } as unknown as ApiKey;
   let sessionService: { findAll: jest.Mock; engineLoaded: jest.Mock };
@@ -405,6 +431,50 @@ describe('SessionController findAll name filter', () => {
     await expect(controller.findAll(apiKey, undefined, undefined, name)).rejects.toBeInstanceOf(BadRequestException);
     expect(sessionService.findAll).not.toHaveBeenCalled();
   });
+
+  it('passes DB-fetched leaseClockNow into engineLoaded for findAll and findOne', async () => {
+    const dbNow = new Date('2026-11-22T12:00:00.000Z');
+    const row: Session = {
+      id: 'sess-uuid-1',
+      name: 'peer-bot',
+      status: SessionStatus.READY,
+      phone: '628111',
+      pushName: 'Peer Bot',
+      config: {},
+      proxyUrl: null,
+      proxyType: null,
+      connectedAt: null,
+      lastActiveAt: null,
+      nodeId: 'peer-node',
+      claimedAt: null,
+      nodeUrl: 'http://peer:2785',
+      leaseExpiresAt: new Date(dbNow.getTime() + 60_000),
+      desiredState: null,
+      createdAt: dbNow,
+      updatedAt: dbNow,
+    };
+    const svc = {
+      findAll: jest.fn().mockResolvedValue([row]),
+      findOne: jest.fn().mockResolvedValue(row),
+      leaseClockNow: jest.fn().mockResolvedValue(dbNow),
+      engineLoaded: jest.fn().mockReturnValue(true),
+    };
+    const ctrl = new SessionControllerClass(
+      svc as unknown as SessionService,
+      { logInfo: jest.fn() } as unknown as AuditService,
+      new ChatScopeService(),
+    );
+
+    const list = await ctrl.findAll(apiKey);
+    expect(list[0].engineLoaded).toBe(true);
+    expect(svc.leaseClockNow).toHaveBeenCalledTimes(1);
+    expect(svc.engineLoaded).toHaveBeenCalledWith(row, dbNow);
+
+    const one = await ctrl.findOne('sess-uuid-1');
+    expect(one.engineLoaded).toBe(true);
+    expect(svc.leaseClockNow).toHaveBeenCalledTimes(2);
+    expect(svc.engineLoaded).toHaveBeenLastCalledWith(row, dbNow);
+  });
 });
 
 // GET /sessions/stats/overview names no :sessionId, so the guard has nothing to scope it against and the
@@ -431,22 +501,34 @@ describe('SessionController getStats scope', () => {
     );
   });
 
-  it("hands the key's allowedSessions to the service and returns its answer", async () => {
-    const apiKey = { allowedSessions: ['sess-uuid-1', 'sess-uuid-2'] } as unknown as ApiKey;
+  it("hands the key's allowedSessions to the service and omits memoryUsage for scoped or non-admin callers", async () => {
+    const apiKey = {
+      role: ApiKeyRole.ADMIN,
+      allowedSessions: ['sess-uuid-1', 'sess-uuid-2'],
+    } as unknown as ApiKey;
 
     await expect(controller.getStats(apiKey)).resolves.toBe(stats);
 
     expect(sessionService.getStats).toHaveBeenCalledTimes(1);
-    expect(sessionService.getStats).toHaveBeenCalledWith(['sess-uuid-1', 'sess-uuid-2']);
+    expect(sessionService.getStats).toHaveBeenCalledWith(['sess-uuid-1', 'sess-uuid-2'], {
+      includeMemoryUsage: false,
+    });
   });
 
-  it('hands over no scope for a key without an allowlist, or for no key', async () => {
-    await controller.getStats({ allowedSessions: null } as unknown as ApiKey);
+  it('includes memoryUsage only for an unscoped ADMIN key', async () => {
+    await controller.getStats({ role: ApiKeyRole.ADMIN, allowedSessions: null } as unknown as ApiKey);
+    await controller.getStats({ role: ApiKeyRole.ADMIN, allowedSessions: [] } as unknown as ApiKey);
+    await controller.getStats({ role: ApiKeyRole.OPERATOR, allowedSessions: null } as unknown as ApiKey);
+    await controller.getStats({ role: ApiKeyRole.VIEWER, allowedSessions: null } as unknown as ApiKey);
     await controller.getStats(undefined);
 
-    // null, undefined and [] all mean "every session" to the service; any list would narrow the totals.
-    const scopes = sessionService.getStats.mock.calls.map((call: unknown[]) => call[0] ?? []);
-    expect(scopes).toEqual([[], []]);
+    expect(sessionService.getStats.mock.calls).toEqual([
+      [null, { includeMemoryUsage: true }],
+      [[], { includeMemoryUsage: true }],
+      [null, { includeMemoryUsage: false }],
+      [null, { includeMemoryUsage: false }],
+      [undefined, { includeMemoryUsage: false }],
+    ]);
   });
 });
 
@@ -596,13 +678,13 @@ describe('SessionController: chat actions map the request to the service', () =>
 // config patch is only meaningful next to the state it merged into.
 describe('SessionController: delete, QR and config routes write their record', () => {
   const ID = 'sess-uuid-1';
-  let sessionService: { findOne: jest.Mock; delete: jest.Mock; getQRCode: jest.Mock; updateConfig: jest.Mock };
+  let sessionService: { findOneForDelete: jest.Mock; delete: jest.Mock; getQRCode: jest.Mock; updateConfig: jest.Mock };
   let auditService: { logInfo: jest.Mock };
   let controller: SessionController;
 
   beforeEach(() => {
     sessionService = {
-      findOne: jest.fn().mockResolvedValue({ id: ID, name: 'my-bot' }),
+      findOneForDelete: jest.fn().mockResolvedValue({ id: ID, name: 'my-bot' }),
       delete: jest.fn().mockResolvedValue(undefined),
       getQRCode: jest.fn(),
       updateConfig: jest.fn(),
@@ -624,7 +706,7 @@ describe('SessionController: delete, QR and config routes write their record', (
       sessionId: ID,
       sessionName: 'my-bot',
     });
-    expect(sessionService.findOne.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(sessionService.findOneForDelete.mock.invocationCallOrder[0]).toBeLessThan(
       sessionService.delete.mock.invocationCallOrder[0],
     );
   });
@@ -656,7 +738,7 @@ describe('SessionController: delete, QR and config routes write their record', (
   });
 
   it('updateConfig records the resulting config rather than the request', async () => {
-    const resulting = { autoRejectCalls: true, maxReconnectAttempts: 5, reconnectBaseDelay: 2000 };
+    const resulting = { autoRejectCalls: true, maxReconnectAttempts: 5, reconnectBaseDelay: 2000, linkPreview: null };
     sessionService.updateConfig.mockResolvedValue(resulting);
 
     await expect(controller.updateConfig(ID, { autoRejectCalls: true })).resolves.toBe(resulting);
@@ -693,6 +775,12 @@ describe('SessionController — proxy() response contract', () => {
       auditService as unknown as AuditService,
       new ChatScopeService(),
     );
+  });
+
+  it('getProxy restricts reads to unscoped ADMIN keys matching updateProxy', () => {
+    const handler = Object.getOwnPropertyDescriptor(SessionControllerClass.prototype, 'getProxy')!.value as object;
+    expect(Reflect.getMetadata(REQUIRED_ROLE_KEY, handler)).toBe(ApiKeyRole.ADMIN);
+    expect(Reflect.getMetadata(UNSCOPED_KEY, handler)).toBe(true);
   });
 
   it('getProxy returns the masked projection without proxyUrl', async () => {

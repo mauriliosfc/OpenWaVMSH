@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import { ErrorBoundary } from './ErrorBoundary';
 import {
   LayoutDashboard,
   Smartphone,
@@ -18,8 +19,10 @@ import {
   Monitor,
   Menu,
   X,
-  ChevronLeft,
-  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Languages,
   UserCheck,
 } from 'lucide-react';
@@ -27,6 +30,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useRole, type UserRole } from '../hooks/useRole';
 import { languageOptions, resolveSupportedLanguage, rtlLanguages, type SupportedLanguage } from '../i18n';
 import { healthApi, infraApi } from '../services/api';
+import { isComposingKey } from '../utils/composition';
 import './Layout.css';
 
 interface LayoutProps {
@@ -60,12 +64,17 @@ const MOBILE_QUERY = '(max-width: 767px)';
 
 export function Layout({ onLogout, userRole }: LayoutProps) {
   const { t, i18n } = useTranslation();
+  const { pathname } = useLocation();
   const { theme, toggleTheme } = useTheme();
   const ThemeIcon = themeIcons[theme];
   const themeLabel = t(`theme.${theme}`);
-  // toggleTheme cycles light, dark, system; the button names the state a click selects.
-  const nextThemeLabel = t('theme.toggleTo', {
-    value: t(`theme.${theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light'}`),
+  // toggleTheme cycles light, dark, system. The button's name starts with the mode it shows, the words a voice user
+  // says to press it, then names the mode a click selects.
+  const themeButtonName = t('common.joinedName', {
+    first: themeLabel,
+    second: t('theme.toggleTo', {
+      value: t(`theme.${theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light'}`),
+    }),
   });
 
   const { scoped } = useRole();
@@ -87,7 +96,9 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
   const [update, setUpdate] = useState<{ latest: string; url: string } | null>(null);
   const [isLanguageMenuOpen, setIsLanguageMenuOpen] = useState(false);
   const languageMenuRef = useRef<HTMLDivElement>(null);
+  const languageButtonRef = useRef<HTMLButtonElement>(null);
   const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     const phone = window.matchMedia(MOBILE_QUERY);
@@ -115,7 +126,10 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
   }, []);
 
   useEffect(() => {
-    if (userRole !== 'admin' || scoped) return;
+    if (userRole !== 'admin' || scoped) {
+      setUpdate(null);
+      return;
+    }
     let active = true;
     infraApi
       .getUpdateCheck()
@@ -137,10 +151,17 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
   };
 
   useEffect(() => {
-    document.body.style.overflow = isMobileOpen ? 'hidden' : '';
-    return () => {
-      document.body.style.overflow = '';
+    if (!isMobileOpen || !mainRef.current) return;
+    const main = mainRef.current;
+    const closeForDialog = () => {
+      if (!main.querySelector('[role="dialog"]')) return;
+      setIsMobileOpen(false);
+      mobileMenuButtonRef.current?.focus();
     };
+    const observer = new MutationObserver(closeForDialog);
+    observer.observe(main, { childList: true, subtree: true });
+    closeForDialog();
+    return () => observer.disconnect();
   }, [isMobileOpen]);
 
   // Escape dismisses the innermost overlay: while the language menu is open it takes the key, then the drawer does.
@@ -151,7 +172,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
     if (!isMobileOpen || isLanguageMenuOpen) return;
 
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || event.isComposing) return;
+      if (event.key !== 'Escape' || isComposingKey(event)) return;
       if (document.querySelector('[role="dialog"]')) return;
       event.preventDefault();
       event.stopPropagation();
@@ -172,15 +193,22 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
         setIsLanguageMenuOpen(false);
       }
     };
+    // Taken on window in the capture phase and marked handled, like the session picker's: the page's own Escape
+    // handlers (the open chat, the emoji picker) skip a handled key, so one press closes only this list. A dialog
+    // above the list keeps its own Escape.
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setIsLanguageMenuOpen(false);
+      if (event.key !== 'Escape' || document.querySelector('[role="dialog"]')) return;
+      event.preventDefault();
+      setIsLanguageMenuOpen(false);
+      // The focused item goes with the menu, so focus returns to the button that opened it.
+      if (languageMenuRef.current?.contains(document.activeElement)) languageButtonRef.current?.focus();
     };
 
     document.addEventListener('mousedown', closeOnOutsideClick);
-    document.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('keydown', closeOnEscape, true);
     return () => {
       document.removeEventListener('mousedown', closeOnOutsideClick);
-      document.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('keydown', closeOnEscape, true);
     };
   }, [isLanguageMenuOpen]);
 
@@ -189,8 +217,10 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
 
   const currentLang = resolveSupportedLanguage(i18n.resolvedLanguage || i18n.language);
   const languageLabel = languageOptions.find(option => option.value === currentLang)?.compactLabel ?? 'EN';
+  const languageButtonName = t('common.joinedName', { first: languageLabel, second: t('common.changeLanguage') });
   const changeLanguage = (language: SupportedLanguage) => {
     setIsLanguageMenuOpen(false);
+    languageButtonRef.current?.focus();
     void i18n.changeLanguage(language);
   };
   const isRtl = rtlLanguages.includes(currentLang);
@@ -230,34 +260,41 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
               <span className="brand-name">{t('common.appName')}</span>
               <span className="brand-version">v{version}</span>
               {update && (
-                <a className="brand-update" href={update.url} target="_blank" rel="noopener noreferrer">
+                <a
+                  className="brand-update"
+                  href={update.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={t('common.updateAvailable', { version: update.latest })}
+                >
                   {t('common.updateAvailable', { version: update.latest })}
                 </a>
               )}
             </div>
           )}
-        </div>
-
-        {!isMobile && (
-          <button
-            className="collapse-toggle"
-            onClick={toggleCollapse}
-            title={isCollapsed ? t('common.expand') : t('common.collapse')}
-            aria-label={isCollapsed ? t('common.expand') : t('common.collapse')}
-          >
-            {isCollapsed ? (
-              isRtl ? (
-                <ChevronLeft size={16} />
+          {/* At the end of the header row, or under the logo on the collapsed rail. The icon is picked for the
+              reading direction, so the panel side follows the mirrored layout. */}
+          {!isMobile && (
+            <button
+              className="collapse-toggle"
+              onClick={toggleCollapse}
+              title={isCollapsed ? t('common.expand') : t('common.collapse')}
+              aria-label={isCollapsed ? t('common.expand') : t('common.collapse')}
+            >
+              {isCollapsed ? (
+                isRtl ? (
+                  <PanelRightOpen size={20} />
+                ) : (
+                  <PanelLeftOpen size={20} />
+                )
+              ) : isRtl ? (
+                <PanelRightClose size={20} />
               ) : (
-                <ChevronRight size={16} />
-              )
-            ) : isRtl ? (
-              <ChevronRight size={16} />
-            ) : (
-              <ChevronLeft size={16} />
-            )}
-          </button>
-        )}
+                <PanelLeftClose size={20} />
+              )}
+            </button>
+          )}
+        </div>
 
         <nav className="sidebar-nav">
           {navItems.map(({ to, icon: Icon, key }) => {
@@ -269,7 +306,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
                 className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
                 end={to === '/'}
                 onClick={handleNavClick}
-                title={collapsed ? label : undefined}
+                title={label}
               >
                 <Icon size={20} />
                 {!collapsed && <span>{label}</span>}
@@ -281,25 +318,26 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
         <div className="sidebar-footer">
           <div className="language-menu" ref={languageMenuRef}>
             <button
+              ref={languageButtonRef}
               className="theme-toggle-btn"
               onClick={() => setIsLanguageMenuOpen(open => !open)}
-              title={t('common.language')}
-              aria-label={t('common.language')}
-              aria-haspopup="menu"
+              title={languageButtonName}
+              aria-label={languageButtonName}
               aria-expanded={isLanguageMenuOpen}
             >
               <Languages size={18} />
               {!collapsed && <span>{languageLabel}</span>}
             </button>
+            {/* A disclosure of plain buttons, not role="menu": it keeps no roving focus or arrow keys, and the
+                role would promise them. */}
             {isLanguageMenuOpen && (
-              <div className="language-menu-list" role="menu" aria-label={t('common.language')}>
+              <div className="language-menu-list" role="group" aria-label={t('common.language')}>
                 {languageOptions.map(option => (
                   <button
                     key={option.value}
                     className={`language-menu-item ${option.value === currentLang ? 'active' : ''}`}
                     onClick={() => changeLanguage(option.value)}
-                    role="menuitemradio"
-                    aria-checked={option.value === currentLang}
+                    aria-current={option.value === currentLang ? 'true' : undefined}
                   >
                     <span>{option.label}</span>
                   </button>
@@ -311,8 +349,8 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
             <button
               className="theme-toggle-btn"
               onClick={toggleTheme}
-              title={nextThemeLabel}
-              aria-label={nextThemeLabel}
+              title={themeButtonName}
+              aria-label={themeButtonName}
             >
               <span className="appearance-button-cue" aria-hidden="true">
                 <ThemeIcon size={16} />
@@ -320,15 +358,22 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
               {!collapsed && <span>{themeLabel}</span>}
             </button>
           </div>
-          <button className="logout-btn" onClick={onLogout} title={collapsed ? t('common.logout') : undefined}>
+          <button className="logout-btn" onClick={onLogout} title={t('common.logout')}>
             <LogOut size={20} />
             {!collapsed && <span>{t('common.logout')}</span>}
           </button>
         </div>
       </aside>
 
-      <main className={`main-content ${collapsed ? 'expanded' : ''} ${isMobile ? 'mobile' : ''}`}>
-        <Outlet />
+      {/* The open drawer covers the page, so the page leaves the tab and reading order until it closes. */}
+      <main
+        ref={mainRef}
+        className={`main-content ${collapsed ? 'expanded' : ''} ${isMobile ? 'mobile' : ''}`}
+        inert={isMobile && isMobileOpen}
+      >
+        <ErrorBoundary resetKey={pathname}>
+          <Outlet />
+        </ErrorBoundary>
       </main>
     </div>
   );

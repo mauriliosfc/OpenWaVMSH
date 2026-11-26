@@ -14,8 +14,10 @@ export interface MutationSource {
   chatId: string;
   /** Whether the account itself made the change, from its phone; undefined when the engine does not say. */
   fromMe?: boolean;
-  /** For a group edit, the participant who wrote the message being edited. */
+  /** For a group edit, the participant who wrote the message being edited; for a group revoke, who sent it. */
   author?: string;
+  /** For a group revoke a member sent, whether the group's roster shows them an admin; undefined when unknown. */
+  admin?: boolean;
 }
 
 /**
@@ -24,7 +26,7 @@ export interface MutationSource {
  * is written with in one spelling and without in the other. A send stores the chat id as its caller wrote
  * it, so the stored form and the one the engine reports can differ in either direction.
  */
-function phoneKey(local: string): string {
+export function phoneKey(local: string): string {
   return local
     .replace(/\D/g, '')
     .replace(/^55(\d{2})9(\d{8})$/, '55$1$2')
@@ -110,7 +112,9 @@ export function provablyDifferent(
  *  - `direction`: an edit, and a revoke in a one-to-one chat, come from the author only, so a change
  *    made by the counterparty cannot name a message the account sent, nor the reverse. Group revokes are
  *    exempt, since an admin may delete anyone's message.
- *  - `author`: a group edit comes from the participant who wrote the message.
+ *  - `author`: a group edit comes from the participant who wrote the message, and so does a group revoke
+ *    by a member the group's roster shows is no admin: it cannot name a message the account sent, nor one
+ *    another member wrote. A lid and a phone number with no reported pairing prove nothing here.
  */
 export function mutationTargetsForeignRow(
   row: StoredMessageRef,
@@ -134,6 +138,15 @@ export function mutationTargetsForeignRow(
   ) {
     return 'author';
   }
+  if (
+    source.kind === 'revoke' &&
+    group &&
+    source.fromMe === false &&
+    source.admin === false &&
+    (row.direction === MessageDirection.OUTGOING || differentWhenPaired(row.author, source.author, resolveLid))
+  ) {
+    return 'author';
+  }
   return null;
 }
 
@@ -151,4 +164,53 @@ export async function mutationTargetsForeignRowPersisted(
     }),
   );
   return mutationTargetsForeignRow(row, source, jid => phones.get(jid) ?? null);
+}
+
+/**
+ * Whether a delivery or read receipt naming `chatId` provably belongs to another chat than the stored row of the
+ * message it names. Baileys relays a peer's receipt under the peer's own chat with every id the stanza lists, and
+ * checks none of them against that chat, so a receipt from one chat could otherwise move another chat's message.
+ *
+ * A receipt for a message the account sent to a broadcast list comes from each recipient's own chat, and one for a
+ * list message an earlier version filed under the list from its sender's chat: neither is foreign. A lid and a
+ * phone with no reported pairing prove nothing either. A receipt only ever moves delivery state forward, and
+ * refusing it would leave the account's messages to a lid-addressed contact at sent.
+ */
+export function receiptTargetsForeignRow(
+  row: StoredMessageRef,
+  chatId: string,
+  resolveLid?: (jid: string) => string | null,
+): boolean {
+  if (isOwnBroadcast(row) || receivedThroughList(row, chatId, resolveLid)) return false;
+  return differentWhenPaired(row.chatId, chatId, resolveLid);
+}
+
+/** {@link provablyDifferent}, except that a lid and a phone number with no reported pairing prove nothing. */
+function differentWhenPaired(
+  a?: string | null,
+  b?: string | null,
+  resolveLid?: (jid: string) => string | null,
+): boolean {
+  const left = a ? entityOf(a) : null;
+  const right = b ? entityOf(b) : null;
+  if (left && right && left.kind !== right.kind && isPerson(left.kind) && isPerson(right.kind)) {
+    if (!resolveLid?.(left.kind === 'lid' ? a! : b!)) return false;
+  }
+  return provablyDifferent(a, b, resolveLid);
+}
+
+/** {@link receiptTargetsForeignRow} with the lids it compares resolved through reported directory data. */
+export async function receiptTargetsForeignRowPersisted(
+  row: StoredMessageRef,
+  chatId: string,
+  resolveLid?: (jid: string) => Promise<string | null>,
+): Promise<boolean> {
+  if (!resolveLid) return receiptTargetsForeignRow(row, chatId);
+  const phones = new Map<string, string | null>();
+  await Promise.all(
+    [...new Set([row.chatId, row.author, chatId])].map(async jid => {
+      if (jid && parseWaId(jid).kind === 'lid') phones.set(jid, await resolveLid(jid).catch(() => null));
+    }),
+  );
+  return receiptTargetsForeignRow(row, chatId, jid => phones.get(jid) ?? null);
 }

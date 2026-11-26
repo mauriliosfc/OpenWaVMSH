@@ -1,6 +1,6 @@
 import { ForbiddenException, Injectable, Optional } from '@nestjs/common';
 import { ApiKey } from './entities/api-key.entity';
-import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { LearnedLidMapping, LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { ContactDirectory, resolveJidCandidates } from '../../engine/identity/jid-candidates';
 import {
   ChatScope,
@@ -53,10 +53,16 @@ export class ChatScopeService {
 
   /**
    * Whether a single requested `chatId` is inside the key's fence. Expands the REQUESTED id once
-   * through the lid table (at most two lookups) instead of expanding the whole allowlist.
+   * through the lid table (at most two lookups) instead of expanding the whole allowlist. A caller that
+   * checks several ids for one key passes the scope it compiled once with {@link scopeFor} for that same
+   * key; left out, the key is compiled here, and `null` is an unrestricted key.
    */
-  allows(apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined, chatId: string): Promise<boolean> {
-    return chatIdAllowed(this.scopeFor(apiKey), chatId, this.singleDirectory());
+  allows(
+    apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined,
+    chatId: string,
+    scope: ChatScope | null = this.scopeFor(apiKey),
+  ): Promise<boolean> {
+    return chatIdAllowed(scope, chatId, this.singleDirectory());
   }
 
   /**
@@ -92,6 +98,11 @@ export class ChatScopeService {
     chatIdOf: (item: T) => string | null | undefined,
   ): Promise<T[]> {
     return filterByChatScope(await this.scopeForFilter(apiKey), items, chatIdOf);
+  }
+
+  /** Subscribe to newly persisted lid->phone mappings when backed by a LidMappingStoreService. */
+  onMappingLearned(listener: (mapping: LearnedLidMapping) => void): () => void {
+    return this.lidStore?.onMappingLearned?.(listener) ?? (() => undefined);
   }
 
   private singleDirectory(): ContactDirectory | undefined {

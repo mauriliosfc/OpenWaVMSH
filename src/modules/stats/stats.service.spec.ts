@@ -302,6 +302,29 @@ describe('StatsService time-series + hourly activity on SQLite (end-to-end regre
     expect(perSession[0].chatId).toBe('chat12@c.us');
   });
 
+  // SQLite keeps no statistics, so GROUP BY m.chatId made it read the whole table in chatId index order for a
+  // window of a few rows (3.2 s over 59k messages, on the event loop). The window must be read through the
+  // createdAt index and the table never scanned.
+  it('the overall top chats read the createdAt window through its index, never the whole table', async () => {
+    await addSession();
+    for (let i = 0; i < 40; i++) await seedMessage({ chatId: `chat${i % 8}@c.us` });
+    const seen: Array<[string, unknown[]]> = [];
+    const query = ds.manager.query.bind(ds.manager);
+    jest.spyOn(ds.manager, 'query').mockImplementation(((sql: string, params?: unknown[]) => {
+      seen.push([sql, params ?? []]);
+      return query(sql, params);
+    }) as never);
+
+    await service.getMessageStats('24h');
+
+    expect(seen).toHaveLength(1);
+    const [sql, params] = seen[0];
+    const plan = await ds.query<Array<{ detail: string }>>(`EXPLAIN QUERY PLAN ${sql}`, params);
+    const details = plan.map(row => row.detail);
+    expect(details.some(d => /USING (COVERING )?INDEX IDX_messages_createdAt/.test(d))).toBe(true);
+    expect(details.filter(d => /^SCAN (messages|m)\b/.test(d))).toEqual([]);
+  });
+
   // Today starts at local midnight, so it must differ from the all-time count. A row two days old is before
   // midnight in every time zone.
   it('counts only the rows since local midnight as today, overall and per session', async () => {
@@ -570,6 +593,51 @@ describe('StatsService aggregate memo (in-process TTL)', () => {
     // full-history scan this service must no longer run.
     for (const sql of captured) {
       expect(sql).toMatch(/WHERE\s+.*"createdAt"\s*>=/i);
+    }
+  });
+
+  it('includes a 19-char SQLite local midnight timestamp without fractional ms in today and 24h boundary counts', async () => {
+    const localMidnight = new Date(2026, 10, 23, 0, 0, 0, 0);
+    const toSqliteUtcText = (d: Date): string => {
+      const p2 = (n: number): string => String(n).padStart(2, '0');
+      return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`;
+    };
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    jest.setSystemTime(new Date(localMidnight.getTime() + 5 * 60_000));
+    try {
+      await ds.getRepository(Message).clear();
+      await ds.getRepository(Session).clear();
+      const service = makeService(0);
+      await ds
+        .getRepository(Session)
+        .save(ds.getRepository(Session).create({ id: 's1', name: 'n', status: SessionStatus.READY, config: {} }));
+      const saveMsg = async (ts: Date): Promise<void> => {
+        const row = await ds.getRepository(Message).save(
+          ds.getRepository(Message).create({
+            sessionId: 's1',
+            chatId: 'c1@c.us',
+            from: 'me@c.us',
+            to: 'c1@c.us',
+            body: 'hi',
+            type: 'text',
+            direction: MessageDirection.OUTGOING,
+            status: MessageStatus.SENT,
+          }),
+        );
+        await ds.query(`UPDATE messages SET createdAt = ? WHERE id = ?`, [toSqliteUtcText(ts), row.id]);
+      };
+      await saveMsg(new Date(localMidnight.getTime() - 60_000));
+      await saveMsg(localMidnight);
+
+      const overview = await service.getOverview();
+      expect(overview.messages.today).toEqual({ sent: 1, received: 0 });
+      expect((await service.getSessionStats('s1')).messages.today).toBe(1);
+
+      jest.setSystemTime(new Date(localMidnight.getTime() + 24 * 60 * 60_000));
+      const stats24h = await service.getMessageStats('24h');
+      expect(stats24h.bySession).toEqual([{ sessionId: 's1', name: 'n', sent: 1, received: 0 }]);
+    } finally {
+      jest.useRealTimers();
     }
   });
 });

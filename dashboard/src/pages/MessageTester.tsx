@@ -30,7 +30,7 @@ import {
 import { PageHeader } from '../components/PageHeader';
 import { GroupPicker } from '../components/GroupPicker';
 import { groupLabel, isGatewayRefusal, planGroupSend } from '../utils/groupSelection';
-import { normalizePhoneText } from '../utils/phone';
+import { normalizePhoneDigits } from '../utils/phone';
 import { sendSequentially } from '../utils/sendSequentially';
 import { keepsSameKey } from '../utils/authLifecycle';
 import './MessageTester.css';
@@ -121,6 +121,20 @@ const fallbackMime: Record<(typeof messageTypes)[number], string> = {
 // Batch statuses that stop the progress polling (mirrors the backend BatchStatus enum).
 const TERMINAL_BATCH_STATUSES: readonly BatchStatus[] = ['completed', 'cancelled', 'failed'];
 
+// The digits of a typed number for the number check, or null past the longest phone number (E.164, 15 digits). A space
+// is number formatting, so two numbers pasted with one between them read as one run, which is no number to look up.
+// A leading 00 is the international exit code (no number starts with 0): dropped before measuring, as the Number
+// Checker drops it.
+const PHONE_DIGITS_MAX = 15;
+// Whether a recipient field names anything: a digit to look up once the exit code is dropped, or an @ of a chat id as
+// typed, which is how the send reads it. With neither, the number check went out as GET .../contacts/check/, which the
+// gateway routes to the contact read of the id "check".
+const namesRecipient = (text: string): boolean => text.includes('@') || normalizePhoneDigits(text) !== '';
+const phoneDigits = (text: string): string | null => {
+  const digits = normalizePhoneDigits(text);
+  return digits.length > PHONE_DIGITS_MAX ? null : digits;
+};
+
 export function MessageTester() {
   const { t } = useTranslation();
   useDocumentTitle(t('messageTester.title'));
@@ -182,6 +196,7 @@ export function MessageTester() {
   const [batchCancelling, setBatchCancelling] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
   const batchPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const batchPollInFlightRef = useRef(false);
   // The session a running batch belongs to: the user may switch the selector mid-batch, and
   // poll/cancel must keep addressing the session the batch was created on.
   const batchSessionRef = useRef('');
@@ -209,6 +224,7 @@ export function MessageTester() {
       clearInterval(batchPollRef.current);
       batchPollRef.current = null;
     }
+    batchPollInFlightRef.current = false;
   };
 
   // Stop polling on unmount; the batch itself keeps running server-side regardless. A send-bulk still
@@ -229,6 +245,8 @@ export function MessageTester() {
     stopBatchPolling();
     if (unmountedRef.current) return;
     const timer = setInterval(async () => {
+      if (batchPollInFlightRef.current) return;
+      batchPollInFlightRef.current = true;
       try {
         const status = await messageApi.getBatchStatus(batchSessionId, batchId);
         // Polling was stopped (a cancel, a terminal status, a new batch, unmount) while this read
@@ -246,6 +264,8 @@ export function MessageTester() {
           stopBatchPolling();
           setBatchError(err instanceof Error ? err.message : t('messageTester.sendFailed'));
         }
+      } finally {
+        if (batchPollRef.current === timer) batchPollInFlightRef.current = false;
       }
     }, 2000);
     batchPollRef.current = timer;
@@ -390,7 +410,7 @@ export function MessageTester() {
       pollOptionsFilled.length >= 2 &&
       pollOptionsFilled.every(option => captionLength(option) <= POLL_OPTION_MAX_LENGTH);
   } else if (messageType === 'forward') {
-    formValid = forwardTo.trim().length > 0 && forwardMessageId.trim().length > 0;
+    formValid = namesRecipient(forwardTo) && forwardMessageId.trim().length > 0;
   } else if (messageType === 'bulk') {
     formValid =
       (content.trim().length > 0 || bulkAttachment !== null) &&
@@ -404,6 +424,9 @@ export function MessageTester() {
       (delayMs === undefined || (!Number.isNaN(delayMs) && delayMs >= 1000 && delayMs <= 60000));
   }
 
+  // A personal recipient is only the default chat a forward is taken from, so a forward from a named chat uses none.
+  const recipientUnused = messageType === 'forward' && recipientType !== 'group' && forwardFrom.trim().length > 0;
+
   // A new send replaces the batch on screen, so it waits for an in-flight cancel: the cancel's answer
   // would otherwise be merged into the newer batch and stop its progress polling.
   const isSendDisabled =
@@ -412,7 +435,9 @@ export function MessageTester() {
     batchCancelling ||
     !session ||
     !formValid ||
-    (messageType !== 'bulk' && (recipientType === 'group' ? selectedGroups.length === 0 : !recipient));
+    (messageType !== 'bulk' &&
+      !recipientUnused &&
+      (recipientType === 'group' ? selectedGroups.length === 0 : !namesRecipient(recipient)));
 
   // Says why Send is held when a field runs past its bound, counted the way `formValid` counts it.
   const tooLongHint = (value: string, max: number) => {
@@ -439,7 +464,7 @@ export function MessageTester() {
         chatIds,
         async chatId => {
           const result = await sendTo(chatId);
-          if (!result.messageId) throw new Error(t('messageTester.sendFailed'));
+          if (typeof result.messageId !== 'string') throw new Error(t('messageTester.sendFailed'));
         },
         {
           delayMs: GROUP_SEND_DELAY_MS,
@@ -485,7 +510,7 @@ export function MessageTester() {
 
   const handleSend = async () => {
     const targetId = recipientType === 'group' ? (selectedGroups[0] ?? '') : recipient;
-    if (!session || (messageType !== 'bulk' && !targetId)) return;
+    if (!session || (messageType !== 'bulk' && !targetId && !recipientUnused)) return;
     const generation = ++sendGenerationRef.current;
     const sameKey = keepsSameKey();
     const isCurrent = () => !unmountedRef.current && generation === sendGenerationRef.current && sameKey();
@@ -507,14 +532,22 @@ export function MessageTester() {
       // than hand-building an engine-specific JID here (#265) — also surfaces unregistered numbers.
       // Bulk carries its own recipient list, so the shared selector's target is not resolved there.
       let chatId = targetId;
-      if (messageType !== 'bulk' && recipientType !== 'group') {
-        const resolved = await contactApi.checkNumber(session, normalizePhoneText(targetId).replace(/[^0-9]/g, ''));
+      // A chat id (anything with an @, such as a lid copied from Chats) goes out as it is, like a forward target: read
+      // as a number it loses its meaning, a lid's digits being no phone and a device suffix joining the phone's digits.
+      if (messageType !== 'bulk' && recipientType !== 'group' && targetId.includes('@')) {
+        chatId = targetId.trim();
+      } else if (messageType !== 'bulk' && recipientType !== 'group' && !recipientUnused) {
+        const digits = phoneDigits(targetId);
+        const resolved = digits === null ? null : await contactApi.checkNumber(session, digits);
         assertCurrent();
-        if (!resolved.exists || !resolved.whatsappId) {
+        if (!resolved?.exists || !resolved.whatsappId) {
           setResponse({
             success: false,
             timestamp: new Date().toISOString(),
-            error: t('messageTester.notOnWhatsApp'),
+            error:
+              digits === null
+                ? t('messageTester.tooLong', { max: PHONE_DIGITS_MAX })
+                : t('messageTester.notOnWhatsApp'),
           });
           return;
         }
@@ -590,10 +623,9 @@ export function MessageTester() {
             // through the same check-number flow as the main recipient.
             let toChatId = forwardTo.trim();
             if (!toChatId.includes('@')) {
-              const resolvedTo = await contactApi.checkNumber(
-                session,
-                normalizePhoneText(toChatId).replace(/[^0-9]/g, ''),
-              );
+              const digits = phoneDigits(toChatId);
+              if (digits === null) throw new Error(t('messageTester.tooLong', { max: PHONE_DIGITS_MAX }));
+              const resolvedTo = await contactApi.checkNumber(session, digits);
               assertCurrent();
               if (!resolvedTo.exists || !resolvedTo.whatsappId) throw new Error(t('messageTester.notOnWhatsApp'));
               toChatId = resolvedTo.whatsappId;
@@ -620,7 +652,7 @@ export function MessageTester() {
       assertCurrent();
 
       setResponse({
-        success: !!result.messageId,
+        success: typeof result.messageId === 'string',
         messageId: result.messageId,
         timestamp: result.timestamp ? new Date(result.timestamp * 1000).toISOString() : new Date().toISOString(),
       });

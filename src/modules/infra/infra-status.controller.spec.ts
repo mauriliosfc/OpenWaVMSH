@@ -185,6 +185,38 @@ describe('InfraStatusController.getStatus engine (reads the real engine.puppetee
       '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu',
     );
   });
+
+  it('defaults to native WhatsApp Web version with zero remote registry fetches when WWEBJS_WEB_VERSION is unset', async () => {
+    const prevVer = process.env.WWEBJS_WEB_VERSION;
+    const prevAllow = process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+    delete process.env.WWEBJS_WEB_VERSION;
+    delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+    const fetchSpy = jest.spyOn(globalThis, 'fetch');
+    try {
+      const config = { get: (key: string, def?: unknown) => (key === 'engine.type' ? 'whatsapp-web.js' : def) };
+      const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
+      const controller = new InfraStatusController(
+        config as never,
+        ds as never,
+        ds as never,
+        {} as never,
+        { isDockerAvailable: () => false } as never,
+        { isAvailable: () => Promise.resolve(false) } as never,
+        { refreshS3Availability: () => Promise.resolve(false) } as never,
+      );
+
+      const status = await controller.getStatus();
+      expect(status.engine.webVersion).toBeNull();
+      expect(status.engine.webVersionSource).toBe('native');
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      if (prevVer === undefined) delete process.env.WWEBJS_WEB_VERSION;
+      else process.env.WWEBJS_WEB_VERSION = prevVer;
+      if (prevAllow === undefined) delete process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED;
+      else process.env.WWEBJS_WEB_VERSION_ALLOW_UNVERIFIED = prevAllow;
+    }
+  });
 });
 
 describe('InfraStatusController.getStatus storage (reads the real storage.localPath key)', () => {
@@ -316,6 +348,12 @@ describe('InfraStatusController.getStatus envPinned', () => {
     });
 
     expect((await buildController().getStatus()).envPinned).toEqual(['DATABASE_HOST', 'REDIS_HOST', 'S3_ENDPOINT']);
+  });
+
+  it('reports a Redis TLS pin beside the built-in selection', async () => {
+    recordPinnedEnvKeys({ REDIS_TLS: 'true' });
+
+    expect((await buildController().getStatus()).envPinned).toEqual(['REDIS_TLS']);
   });
 
   it('reports an empty list when nothing above data/.env.generated supplies a selection key', async () => {
@@ -626,5 +664,60 @@ describe('InfraStatusController.getStatus running bundled containers', () => {
       false,
       false,
     ]);
+  });
+});
+
+describe('InfraStatusController unavailable Docker inventory', () => {
+  let previousHost: string | undefined;
+  beforeEach(() => {
+    previousHost = process.env.REDIS_HOST;
+    process.env.REDIS_HOST = 'redis';
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue('REDIS_BUILTIN=true\n');
+  });
+  afterEach(() => {
+    if (previousHost === undefined) delete process.env.REDIS_HOST;
+    else process.env.REDIS_HOST = previousHost;
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+  });
+
+  it('distinguishes an unavailable inventory from an observed empty list and later recovery', async () => {
+    const running = { database: false, cache: 'openwa', storage: false };
+    const inventory = jest
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        database: false,
+        cache: false,
+        storage: false,
+      })
+      .mockResolvedValueOnce(running);
+    const config = {
+      get: (key: string, fallback?: unknown) =>
+        key === 'redis.host' ? 'redis' : key === 'engine.type' ? 'baileys' : fallback,
+    };
+    const database = { isInitialized: true, query: jest.fn().mockResolvedValue([]) };
+    const controller = new InfraStatusController(
+      config as never,
+      database as never,
+      database as never,
+      {} as never,
+      { isDockerAvailable: () => true, getRunningBuiltinServices: inventory } as never,
+      { isAvailable: jest.fn().mockResolvedValue(false) } as never,
+      {} as never,
+    );
+    const unavailable = await controller.getStatus();
+    const empty = await controller.getStatus();
+    const recovered = await controller.getStatus();
+
+    expect(unavailable.redis.builtIn).toBe(true);
+    expect(unavailable.redis).not.toHaveProperty('running');
+    expect(empty.redis.builtIn).toBe(false);
+    expect(empty.redis.running).toBe(false);
+    expect(recovered.redis.builtIn).toBe(true);
+    expect(recovered.redis.running).toBe(true);
   });
 });

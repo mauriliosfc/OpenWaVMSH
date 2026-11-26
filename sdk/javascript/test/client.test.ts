@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   OpenWAClient,
+  buildUrl,
   OpenWAApiError,
   OpenWAAuthError,
   OpenWAForbiddenError,
@@ -58,6 +59,15 @@ describe('OpenWAClient', () => {
     const c = new OpenWAClient({ baseUrl: 'http://localhost:2785/', apiKey: 'k', fetch: t.asFetch() });
     await c.sessions.list();
     expect(t.lastCall!.url).toBe('http://localhost:2785/api/sessions');
+  });
+
+  it('keeps a base URL path prefix on typed and raw calls', async () => {
+    // Behind a reverse proxy at /openwa/, losing the prefix would send every call to a route that 404s.
+    const t = new MockTransport().on('GET', '/openwa/', { body: [] });
+    const c = new OpenWAClient({ baseUrl: 'http://h/openwa/', apiKey: 'k', fetch: t.asFetch() });
+    await c.sessions.list();
+    await c.request({ method: 'GET', path: '//api/x', query: { limit: 5 } });
+    expect(t.calls.map(call => call.url)).toEqual(['http://h/openwa/api/sessions', 'http://h/openwa//api/x?limit=5']);
   });
 
   it('does not auto-follow redirects (passes redirect: manual to fetch)', async () => {
@@ -123,6 +133,44 @@ describe('OpenWAClient', () => {
     expect(t.calls).toHaveLength(2);
   });
 
+  it('refuses a dot part inside an id, which a proxy decoding %2F would resolve', async () => {
+    // Sent as one encoded segment ("..%2Fx"), such an id reaches another route behind a proxy that decodes
+    // %2F before it resolves dot segments (nginx with a URI on proxy_pass).
+    const t = new MockTransport().passthrough({ status: 204 });
+    const c = client(t);
+    await expect(c.templates.delete('S', '../../../sessions/V')).rejects.toThrow(TypeError);
+    await expect(c.webhooks.delete('s1', 'a/./b')).rejects.toThrow(TypeError);
+    const raw = { method: 'DELETE' as const, path: '/api/sessions/s1/contacts/..%2Fwebhooks%2Fw1' };
+    await expect(c.request(raw)).rejects.toThrow(TypeError);
+    expect(t.calls).toHaveLength(0);
+
+    // A slash inside an id with no dot part, as a caller-chosen batch or label id may hold, still goes out.
+    await c.webhooks.delete('s1', 'a/b');
+    await c.webhooks.delete('s1', 'v1.0/x');
+    expect(t.calls.map(call => call.url)).toEqual([
+      'http://localhost:2785/api/sessions/s1/webhooks/a%2Fb',
+      'http://localhost:2785/api/sessions/s1/webhooks/v1.0%2Fx',
+    ]);
+  });
+
+  it('refuses an id encodeURIComponent cannot encode as a rejection, not a synchronous throw', async () => {
+    const t = new MockTransport().passthrough({ status: 200, body: {} });
+    const c = client(t);
+    let pending: Promise<unknown> | undefined;
+    // A lone surrogate, as left by cutting a string inside an emoji.
+    expect(() => {
+      pending = c.contacts.get('s1', '\uD800');
+    }).not.toThrow();
+    await expect(pending).rejects.toThrow(TypeError);
+    expect(t.calls).toHaveLength(0);
+  });
+
+  it('encodes the sendMedia route segment, so it cannot add a query or fragment', async () => {
+    const t = new MockTransport().passthrough({ status: 201, body: { messageId: 'm', timestamp: 1 } });
+    await client(t).sendMedia('s1', 'send-image?x=1#f', { chatId: 'a@c.us', url: 'https://x.test/i.png' });
+    expect(t.lastCall!.url).toBe('http://localhost:2785/api/sessions/s1/messages/send-image%3Fx%3D1%23f');
+  });
+
   it('refuses a raw path that does not begin with a slash, so the request never leaves the base host', async () => {
     const t = new MockTransport().passthrough({ status: 200, body: [] });
     const c = client(t);
@@ -159,6 +207,91 @@ describe('OpenWAClient', () => {
     const t = new MockTransport().passthrough({ status: 200, body: [] });
     await client(t).request({ method: 'GET', path: '/api/sessions?limit=5', query: { name: 'x' } });
     expect(t.lastCall!.url).toBe('http://localhost:2785/api/sessions?limit=5&name=x');
+  });
+
+  it('puts query params before the fragment of a raw path', async () => {
+    const cases: Array<[string, string]> = [
+      ['/api/sessions#tab', '/api/sessions?name=x#tab'],
+      ['/api/sessions?limit=5#tab', '/api/sessions?limit=5&name=x#tab'],
+      ['/api/sessions#tab?fake=1', '/api/sessions?name=x#tab?fake=1'],
+      ['/api/sessions#', '/api/sessions?name=x#'],
+    ];
+    for (const [path, expected] of cases) {
+      const t = new MockTransport().passthrough({ status: 200, body: [] });
+      await client(t).request({ method: 'GET', path, query: { name: 'x' } });
+      expect(t.lastCall!.url).toBe(`http://localhost:2785${expected}`);
+      expect(new URL(t.lastCall!.url).searchParams.get('name')).toBe('x');
+    }
+  });
+
+  // A URLSearchParams and a Map are objects too, so the raw request accepts them as a query. Their entries
+  // are not own properties; read as such, they sent the call unfiltered.
+  it('serializes a URLSearchParams query', async () => {
+    const t = new MockTransport().passthrough({ status: 200, body: [] });
+    await client(t).request({
+      method: 'GET',
+      path: '/api/sessions/s1/messages',
+      query: new URLSearchParams({ chatId: '628123@c.us', limit: '10' }),
+    });
+    expect(t.lastCall!.url).toBe('http://localhost:2785/api/sessions/s1/messages?chatId=628123%40c.us&limit=10');
+  });
+
+  it('sends every value of a repeated URLSearchParams key', async () => {
+    const t = new MockTransport().passthrough({ status: 200, body: [] });
+    const query = new URLSearchParams();
+    query.append('type', 'text');
+    query.append('type', 'image');
+    await client(t).request({ method: 'GET', path: '/api/sessions/s1/messages', query });
+    expect(t.lastCall!.url).toBe('http://localhost:2785/api/sessions/s1/messages?type=text&type=image');
+  });
+
+  it('serializes a Map query like the same plain object', async () => {
+    const t = new MockTransport().passthrough({ status: 200, body: [] });
+    const query = new Map<string, unknown>([
+      ['chatId', 'a@c.us'],
+      ['limit', 10],
+      ['from', undefined],
+      ['to', null],
+      ['fromMe', false],
+      ['types', ['text', 'image']],
+    ]);
+    const c = client(t);
+    await c.request({ method: 'GET', path: '/api/sessions/s1/messages', query });
+    await c.request({ method: 'GET', path: '/api/sessions/s1/messages', query: Object.fromEntries(query) });
+    expect(t.calls[0].url).toBe(
+      'http://localhost:2785/api/sessions/s1/messages?chatId=a%40c.us&limit=10&fromMe=false&types=text%2Cimage',
+    );
+    expect(t.calls[1].url).toBe(t.calls[0].url);
+  });
+
+  it('puts a URLSearchParams query after the query string of a raw path and before its fragment', async () => {
+    const t = new MockTransport().passthrough({ status: 200, body: [] });
+    await client(t).request({
+      method: 'GET',
+      path: '/api/sessions?limit=5#tab',
+      query: new URLSearchParams({ name: 'x' }),
+    });
+    expect(t.lastCall!.url).toBe('http://localhost:2785/api/sessions?limit=5&name=x#tab');
+  });
+
+  it('adds no query string for an empty URLSearchParams or Map', async () => {
+    const t = new MockTransport().passthrough({ status: 200, body: [] });
+    const c = client(t);
+    await c.request({ method: 'GET', path: '/api/sessions', query: new URLSearchParams() });
+    await c.request({ method: 'GET', path: '/api/sessions', query: new Map() });
+    expect(t.calls.map(call => call.url)).toEqual([
+      'http://localhost:2785/api/sessions',
+      'http://localhost:2785/api/sessions',
+    ]);
+  });
+
+  it('serializes a Map query for requestBytes and a URLSearchParams query for buildUrl', async () => {
+    const t = new MockTransport().passthrough({ status: 200, body: [] });
+    await client(t).requestBytes({ method: 'GET', path: '/api/search/', query: new Map([['q', 'x']]) });
+    expect(t.lastCall!.url).toBe('http://localhost:2785/api/search/?q=x');
+    expect(buildUrl('http://localhost:2785/', '/api/search', new URLSearchParams({ q: 'a b' }))).toBe(
+      'http://localhost:2785/api/search?q=a+b',
+    );
   });
 
   it('maps a 404 to OpenWANotFoundError with parsed body', async () => {
@@ -323,6 +456,21 @@ describe('OpenWAClient', () => {
     // Only whole seconds or an HTTP date count; Date.parse would read '-5' or '1.5' as a past date.
     for (const bad of ['soon', '-5', '1.5', 'Tue 5']) {
       expect((await fail({ status: 503, headers: { 'Retry-After': bad } })).retryAfterSeconds).toBeUndefined();
+    }
+
+    // A wait is capped at 2147483 seconds, the longest a caller can pass to setTimeout (times 1000) without
+    // it firing at once, whether it comes from the header, an HTTP date or the body.
+    const ceiling = 2147483;
+    for (const huge of ['9999999999', '1'.repeat(25), '9'.repeat(400), '2147484']) {
+      expect((await fail({ status: 503, headers: { 'Retry-After': huge } })).retryAfterSeconds).toBe(ceiling);
+    }
+    expect((await fail({ status: 503, headers: { 'Retry-After': '2147483' } })).retryAfterSeconds).toBe(ceiling);
+    expect((await fail({ status: 503, headers: { 'Retry-After': '86400' } })).retryAfterSeconds).toBe(86400);
+    const farDate = await fail({ status: 503, headers: { 'Retry-After': 'Fri, 31 Dec 9999 23:59:59 GMT' } });
+    expect(farDate.retryAfterSeconds).toBe(ceiling);
+    for (const retryAfterSeconds of [1e300, 9999999999, 2147483.5]) {
+      const err = await fail({ status: 429, body: { statusCode: 429, message: 'x', retryAfterSeconds } });
+      expect(err.retryAfterSeconds).toBe(ceiling);
     }
 
     const logout = await fail({
@@ -706,5 +854,23 @@ describe('OpenWAClient', () => {
     const c = new OpenWAClient({ baseUrl: 'http://localhost', apiKey: 'k', fetch: strictFetch });
     await expect(c.sessions.list()).resolves.toEqual([]);
     expect(receivers).toEqual([undefined]);
+  });
+
+  it('clones defaultHeaders on construction so post-hoc caller mutations do not alias requests', async () => {
+    const seen: Record<string, string>[] = [];
+    const fetchMock: FetchLike = async (_url, init) => {
+      seen.push({ ...(init?.headers as Record<string, string>) });
+      return new Response('[]', { status: 200 });
+    };
+    const defaultHeaders: Record<string, string> = { 'X-Tenant': 'alpha' };
+    const c = new OpenWAClient({ baseUrl: 'http://localhost', apiKey: 'k', fetch: fetchMock, defaultHeaders });
+
+    defaultHeaders['X-Tenant'] = 'mutated';
+    defaultHeaders['X-Injected'] = 'evil';
+
+    await c.sessions.list();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]['X-Tenant']).toBe('alpha');
+    expect(seen[0]['X-Injected']).toBeUndefined();
   });
 });

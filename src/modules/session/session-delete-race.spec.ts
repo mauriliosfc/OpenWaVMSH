@@ -18,6 +18,7 @@ import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.ent
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { Template } from '../template/entities/template.entity';
+import { AutomationRule } from '../automation/entities/automation-rule.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
@@ -42,6 +43,7 @@ const entities = [
   WebhookDeliveryFailure,
   IntegrationDeliveryFailure,
   Template,
+  AutomationRule,
   BaileysStoredMessage,
   ChatState,
   StatusUpdate,
@@ -124,7 +126,7 @@ describe('A session being deleted', () => {
           provide: ConfigService,
           useValue: { get: jest.fn(<T>(key: string, def?: T): T => (key in values ? (values[key] as T) : (def as T))) },
         },
-        { provide: LidMappingStoreService, useValue: { remember: jest.fn() } },
+        { provide: LidMappingStoreService, useValue: { remember: jest.fn(), onSecondLid: jest.fn() } },
         { provide: StatusStoreService, useValue: { ingest: jest.fn(), captureWrites: jest.fn() } },
       ],
     }).compile();

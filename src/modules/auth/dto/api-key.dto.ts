@@ -110,7 +110,8 @@ export class ApiKeyResponseDto {
   name!: string;
 
   @ApiProperty({
-    description: 'First 12 characters of the key (for identification)',
+    description:
+      'First 12 characters of the key (for identification). A key seeded from API_MASTER_KEY lists the fixed text "(master key)" instead, except one seeded by an earlier release, which lists its first 12 characters.',
   })
   keyPrefix!: string;
 
@@ -169,6 +170,21 @@ export class ValidateApiKeyResponseDto {
     example: false,
   })
   scoped?: boolean;
+}
+
+/** Result of `POST /auth/session` and `GET /auth/session`. */
+export class BrowserSessionResponseDto extends ValidateApiKeyResponseDto {
+  @ApiProperty({
+    description: 'ID of the API key bound to this browser session.',
+    example: '550e8400-e29b-41d4-a716-446655440000',
+  })
+  apiKeyId!: string;
+}
+
+/** Result of `DELETE /auth/session`. */
+export class BrowserSessionLogoutResponseDto {
+  @ApiProperty({ description: 'Always true once the session cookie has been cleared.', example: true })
+  ok!: boolean;
 }
 
 export class UpdateApiKeyDto {

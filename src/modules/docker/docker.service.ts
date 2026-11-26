@@ -56,29 +56,58 @@ export class DockerService implements OnModuleInit {
   private readonly logger = createLogger(DockerService.name);
   private docker: Docker | null = null;
   private isAvailable = false;
+  /** Whether a daemon has ever answered, so a later loss is a reconnect and not a deployment without Docker. */
+  private hasConnected = false;
   private reinitInFlight = false;
   /** Visible for testing. */
   callTimeoutMs = DOCKER_CALL_TIMEOUT_MS;
+  /** Visible for testing. Bounded timeout for image pulls when no cached image exists. */
+  pullTimeoutMs = 5 * 60 * 1000;
+  /** Visible for testing. Bounded timeout for container stop calls (exceeds Docker's 10s SIGTERM grace). */
+  stopTimeoutMs = 25 * 1000;
 
   /**
    * dockerode sets no timeout, so a daemon or socket proxy that accepts the connection and never
    * answers (a dropped SYN, a wedged upstream) would hold the caller, boot included, until the OS or
-   * the proxy gave up. Short calls are bounded here; image pulls and container starts are not.
+   * the proxy gave up. Short calls, pulls, starts, stops, and container/volume creation are bounded here.
    *
    * The call is aborted when the deadline passes, not only raced: a call left running keeps its request
    * and its socket open, and every later availability check would add one more.
    */
-  private async answered<T>(call: (signal: AbortSignal) => Promise<T>, what: string): Promise<T> {
+  private async answered<T>(
+    call: (signal: AbortSignal) => Promise<T>,
+    what: string,
+    timeoutMs = this.callTimeoutMs,
+  ): Promise<T> {
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        reject(new Error(`Docker did not answer ${what} within ${this.callTimeoutMs}ms`));
+        reject(new Error(`Docker did not answer ${what} within ${timeoutMs}ms`));
         controller.abort();
-      }, this.callTimeoutMs);
+      }, timeoutMs);
+      timer.unref?.();
     });
     try {
       return await Promise.race([call(controller.signal), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async raceTimeout<T>(work: Promise<T>, timeoutMs: number, what: string, onTimeout?: () => void): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        onTimeout?.();
+        reject(new Error(`Docker did not complete ${what} within ${timeoutMs}ms`));
+      }, timeoutMs);
+      timer.unref?.();
+    });
+    // Suppress unhandled rejection if work settles after the timeout won the race.
+    work.catch(() => undefined);
+    try {
+      return await Promise.race([work, deadline]);
     } finally {
       clearTimeout(timer);
     }
@@ -148,10 +177,21 @@ export class DockerService implements OnModuleInit {
   }
 
   private async initializeDocker(): Promise<void> {
+    const options = this.buildDockerOptions();
+    if (!options) {
+      this.docker = null;
+      this.isAvailable = false;
+      this.logger.log(
+        'Docker orchestration disabled (enable the docker-proxy profile with DOCKER_HOST=tcp://docker-proxy:2375, ' +
+          'or set DOCKER_ALLOW_LOCAL_SOCKET=true for local Unix socket access)',
+      );
+      return;
+    }
     try {
-      this.docker = new Docker(this.buildDockerOptions());
+      this.docker = new Docker(options);
       await this.answered(abortSignal => this.abortable<unknown>('ping', abortSignal), 'a ping');
       this.isAvailable = true;
+      this.hasConnected = true;
       this.logger.log('Docker API connected successfully');
     } catch (error) {
       this.logger.warn('Docker not available. Container orchestration disabled.', {
@@ -162,15 +202,24 @@ export class DockerService implements OnModuleInit {
   }
 
   // Visible for testing
-  buildDockerOptions(): Docker.DockerOptions {
-    const dockerHost = process.env.DOCKER_HOST;
+  buildDockerOptions(): Docker.DockerOptions | null {
+    const dockerHost = process.env.DOCKER_HOST?.trim();
+    const allowLocalSocket = process.env.DOCKER_ALLOW_LOCAL_SOCKET === 'true';
+
     if (dockerHost) {
       const match = /^tcp:\/\/([^:]+):(\d+)$/.exec(dockerHost);
       if (match) {
         return { host: match[1], port: parseInt(match[2], 10), protocol: 'http' };
       }
+      if (dockerHost.startsWith('unix://')) {
+        if (!allowLocalSocket) return null;
+        const socketPath = dockerHost.slice('unix://'.length);
+        return { socketPath: socketPath || '/var/run/docker.sock' };
+      }
+      return null;
     }
-    return { socketPath: '/var/run/docker.sock' };
+
+    return allowLocalSocket ? { socketPath: '/var/run/docker.sock' } : null;
   }
 
   /**
@@ -180,25 +229,35 @@ export class DockerService implements OnModuleInit {
    * (DOCKER_HOST=tcp://...), the proxy container may not be accepting connections at
    * the moment onModuleInit runs (compose `service_started` doesn't wait for readiness).
    * If the first connect failed, retry it once in the background here so orchestration
-   * recovers without a process restart. Only for the DOCKER_HOST (proxy/tcp) case — a
-   * socket-based or docker-less deployment has no such race.
+   * recovers without a process restart. Only when a valid Docker endpoint is configured
+   * (DOCKER_HOST=tcp://... or an opted-in local socket that answered before): a
+   * docker-less deployment triggers zero background retries.
    */
   isDockerAvailable(): boolean {
-    if (!this.isAvailable && !this.reinitInFlight && process.env.DOCKER_HOST) {
+    if (
+      !this.isAvailable &&
+      !this.reinitInFlight &&
+      this.buildDockerOptions() !== null &&
+      (process.env.DOCKER_HOST?.trim() || this.hasConnected)
+    ) {
       this.reinitInFlight = true;
-      void this.initializeDocker().finally(() => {
-        this.reinitInFlight = false;
-      });
+      void this.initializeDocker()
+        .then(() => this.bootstrapOrchestration())
+        .catch(error => this.logger.warn('Could not start built-in services after Docker recovery', String(error)))
+        .finally(() => {
+          this.reinitInFlight = false;
+        });
     }
     return this.isAvailable;
   }
 
   /**
-   * List all OpenWA-related containers
+   * List all OpenWA-related containers, or null when the daemon could not be asked: an empty list
+   * means it was asked and none exist, which callers act on.
    */
-  async listContainers(): Promise<ContainerInfo[]> {
+  async listContainers(): Promise<ContainerInfo[] | null> {
     if (!this.docker || !this.isAvailable) {
-      return [];
+      return null;
     }
 
     try {
@@ -221,7 +280,8 @@ export class DockerService implements OnModuleInit {
         }));
     } catch (error) {
       this.logger.error('Failed to list containers', error);
-      return [];
+      this.isAvailable = false;
+      return null;
     }
   }
 
@@ -230,10 +290,14 @@ export class DockerService implements OnModuleInit {
    * `com.openwa.service` label (`database` | `cache` | `storage`), and who created each: `'compose'` for one
    * Docker Compose created (it carries Compose's project label and belongs to the deployment), `'openwa'` for
    * one createService made. Lets the dashboard show the real built-in state instead of the saved intent. All
-   * false when Docker is unavailable or none run.
+   * false when none run; null when Docker could not be observed.
    */
-  async getRunningBuiltinServices(): Promise<Record<'database' | 'cache' | 'storage', false | 'compose' | 'openwa'>> {
+  async getRunningBuiltinServices(): Promise<Record<
+    'database' | 'cache' | 'storage',
+    false | 'compose' | 'openwa'
+  > | null> {
     const containers = await this.listContainers();
+    if (containers === null) return null;
     const creator = (svc: string): false | 'compose' | 'openwa' => {
       const running = containers.find(
         c =>
@@ -246,7 +310,8 @@ export class DockerService implements OnModuleInit {
   }
 
   /**
-   * Get container by service name or label
+   * Get container by service name or label. Null when there is none, and also when the daemon could not be asked or
+   * did not answer: a caller that must tell the two apart uses findContainerByService.
    */
   async getContainerByService(service: string): Promise<Docker.Container | null> {
     if (!this.docker || !this.isAvailable) {
@@ -254,40 +319,74 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const containers = await this.answered(
-        abortSignal =>
-          this.docker!.listContainers({
-            all: true,
-            filters: {
-              label: [`com.openwa.service=${service}`],
-            },
-            abortSignal,
-          }),
-        'a container list',
-      );
-
-      if (containers.length > 0) {
-        return this.docker.getContainer(containers[0].Id);
-      }
-
-      // Fallback: try by EXACT name (never a substring — a substring, and especially the empty
-      // string, would resolve an arbitrary container). OpenWA-managed containers are `openwa-<service>`.
-      const target = `openwa-${service}`;
-      const allContainers = await this.answered(
-        abortSignal => this.docker!.listContainers({ all: true, abortSignal }),
-        'a container list',
-      );
-      const match = allContainers.find(c => c.Names?.some(n => n === target || n === `/${target}`));
-
-      if (match) {
-        return this.docker.getContainer(match.Id);
-      }
-
-      return null;
+      return await this.findContainerByService(service);
     } catch (error) {
       this.logger.error(`Failed to get container for service: ${service}`, error);
       return null;
     }
+  }
+
+  /**
+   * The container of a service: null only when the daemon answered and none matches. Unlike getContainerByService it
+   * throws when the daemon is unavailable, fails or does not answer in time, for a caller that must not read
+   * "unknown" as "absent" (a stop).
+   */
+  private async findContainerByService(service: string): Promise<Docker.Container | null> {
+    if (!this.docker || !this.isAvailable) {
+      throw new Error('Docker is not available');
+    }
+    if (!service) {
+      return null;
+    }
+
+    const profileToService: Record<string, string> = {
+      postgres: 'database',
+      redis: 'cache',
+      minio: 'storage',
+    };
+    const serviceToProfile: Record<string, string> = {
+      database: 'postgres',
+      cache: 'redis',
+      storage: 'minio',
+    };
+    const canonicalService = profileToService[service] || service;
+    const canonicalProfile = serviceToProfile[service] || service;
+
+    const containers = await this.answered(
+      abortSignal =>
+        this.docker!.listContainers({
+          all: true,
+          filters: {
+            label: [`com.openwa.service=${canonicalService}`],
+          },
+          abortSignal,
+        }),
+      'a container list',
+    );
+
+    if (containers.length > 0) {
+      return this.docker.getContainer(containers[0].Id);
+    }
+
+    // Fallback: try matching com.openwa.service aliases or exact OpenWA-managed container names
+    // (never a substring, which would resolve and touch unrelated containers).
+    const exactNames = new Set([`openwa-${service}`, `openwa-${canonicalService}`, `openwa-${canonicalProfile}`]);
+    const allContainers = await this.answered(
+      abortSignal => this.docker!.listContainers({ all: true, abortSignal }),
+      'a container list',
+    );
+    const match = allContainers.find(
+      c =>
+        c.Labels?.['com.openwa.service'] === service ||
+        c.Labels?.['com.openwa.service'] === canonicalService ||
+        c.Names?.some(n => exactNames.has(n.replace(/^\//, ''))),
+    );
+
+    if (match) {
+      return this.docker.getContainer(match.Id);
+    }
+
+    return null;
   }
 
   /**
@@ -312,8 +411,9 @@ export class DockerService implements OnModuleInit {
    *    127.0.0.1:9000/9001. The specs below publish nothing, like postgres and redis: they run the
    *    fixed built-in credentials, which the boot guard exempts only because the container is
    *    reachable on the internal network alone. The app reaches it by its `minio` alias.
-   *  - Resource limits: neither path sets CPU/memory/PID limits on the datastore containers;
-   *    only openwa-api carries mem_limit/pids_limit (in compose).
+   *  - Hardening and resource limits: both paths apply `no-new-privileges:true`, `cap_drop: [ALL]`
+   *    (plus minimal `cap_add` for postgres/redis entrypoint chown + privilege drop), memory limits,
+   *    and PID ceilings in lockstep.
    */
   private getContainerSpec(profile: string): {
     image: string;
@@ -325,6 +425,10 @@ export class DockerService implements OnModuleInit {
     healthcheck?: { test: string[]; interval: number; timeout: number; retries: number };
     labels: Record<string, string>;
     securityOpt: string[];
+    capDrop: string[];
+    capAdd?: string[];
+    memoryBytes: number;
+    pidsLimit: number;
   } | null {
     // A container outlives the process that creates it, and after a dashboard save the restart that
     // creates it runs in the OLD process, whose env still holds the values the save just replaced.
@@ -333,17 +437,27 @@ export class DockerService implements OnModuleInit {
     let saved: Record<string, string> | undefined;
     const nextBoot = (key: string): string | undefined =>
       isEnvPinned(key) || isOsProvidedEnv(key) ? process.env[key] : (saved ??= readGeneratedEnv())[key];
+    const redisPassword = nextBoot('REDIS_PASSWORD');
     const specs: Record<string, ReturnType<typeof this.getContainerSpec>> = {
       redis: {
         image: 'redis:7-alpine',
         name: 'openwa-redis',
         alias: 'redis', // DNS alias for resolution
         // noeviction mirrors docker-compose.yml: BullMQ requires it, or Redis may evict queue keys
-        // once maxmemory is reached and silently drop queued jobs.
-        cmd: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction'],
+        // once maxmemory is reached and silently drop queued jobs. Enforces --requirepass when
+        // REDIS_PASSWORD is configured; stays passwordless on the internal network when unset.
+        cmd: [
+          'sh',
+          '-c',
+          'if [ -n "$REDIS_PASSWORD" ]; then exec docker-entrypoint.sh redis-server --appendonly yes --maxmemory-policy noeviction --requirepass "$REDIS_PASSWORD"; else exec docker-entrypoint.sh redis-server --appendonly yes --maxmemory-policy noeviction; fi',
+        ],
+        ...(redisPassword ? { env: [`REDIS_PASSWORD=${redisPassword}`] } : {}),
         volumes: [{ name: 'openwa_redis-data', path: '/data' }],
         healthcheck: {
-          test: ['CMD', 'redis-cli', 'ping'],
+          test: [
+            'CMD-SHELL',
+            'if [ -n "$REDIS_PASSWORD" ]; then REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping; else redis-cli ping; fi',
+          ],
           interval: 5000000000, // 5s in nanoseconds
           timeout: 3000000000,
           retries: 5,
@@ -353,12 +467,16 @@ export class DockerService implements OnModuleInit {
           'com.openwa.builtin': 'true',
         },
         securityOpt: ['no-new-privileges:true'],
+        capDrop: ['ALL'],
+        capAdd: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETGID', 'SETUID'],
+        memoryBytes: 512 * 1024 * 1024,
+        pidsLimit: 256,
       },
       postgres: {
         image: 'postgres:16-alpine',
         name: 'openwa-postgres',
         alias: 'postgres',
-        // The built-in credentials — the dashboard saves them to data/.env.generated
+        // The built-in credentials: the dashboard saves them to data/.env.generated
         // (infra-config.controller) and the production boot guard exempts the default pair only for the
         // built-in, internal-host deployment (see the getContainerSpec docblock). The password is the
         // one the next boot dials with, like the MinIO keys below: a custom one saved with the built-in
@@ -381,11 +499,15 @@ export class DockerService implements OnModuleInit {
           'com.openwa.builtin': 'true',
         },
         securityOpt: ['no-new-privileges:true'],
+        capDrop: ['ALL'],
+        capAdd: ['CHOWN', 'DAC_OVERRIDE', 'FOWNER', 'SETGID', 'SETUID'],
+        memoryBytes: 1024 * 1024 * 1024,
+        pidsLimit: 256,
       },
       minio: {
         // Same pin (release tag and digest) as the compose minio service; never a floating tag.
         image:
-          'pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46',
+          'pgsty/silo:RELEASE.2026-11-12T00-00-00Z@sha256:c20d112390b9a9ce8c11b8af95ad35bcaa62f4759663c09c936cd8d2b511f329',
         name: 'openwa-minio',
         alias: 'minio',
         cmd: ['server', '/data', '--console-address', ':9001'],
@@ -407,6 +529,9 @@ export class DockerService implements OnModuleInit {
           'com.openwa.builtin': 'true',
         },
         securityOpt: ['no-new-privileges:true'],
+        capDrop: ['ALL'],
+        memoryBytes: 1024 * 1024 * 1024,
+        pidsLimit: 256,
       },
     };
     return specs[profile] || null;
@@ -433,14 +558,14 @@ export class DockerService implements OnModuleInit {
       // Check if container already exists
       const existing = await this.getContainerByService(profile);
       if (existing) {
-        const info = await existing.inspect();
+        const info = await this.answered(abortSignal => existing.inspect({ abortSignal }), 'a container inspection');
         this.warnOnImageDrift(profile, spec.name, info);
         if (info.State.Running) {
           this.logger.log(`Container ${spec.name} already running`);
           return true;
         }
         // Start existing container
-        await existing.start();
+        await this.raceTimeout(existing.start(), this.callTimeoutMs, `starting existing container ${spec.name}`);
         this.logger.log(`Started existing container: ${spec.name}`);
         return true;
       }
@@ -448,32 +573,58 @@ export class DockerService implements OnModuleInit {
       // Pull only when the image is not already on the host, as compose's default
       // `pull_policy: missing` does: a host that has the image keeps working when the registry is
       // unreachable or has withdrawn it. As with compose, a cached floating tag is not refreshed
-      // here. Any inspect failure falls back to pulling.
-      const cached = await this.docker
-        .getImage(spec.image)
-        .inspect()
-        .then(
-          () => true,
-          () => false,
-        );
+      // here. Only an answer that the image is absent pulls: a daemon that fails or does not answer the
+      // inspection could not complete a pull either, and the pull itself is bounded by pullTimeoutMs.
+      const cached = await this.answered(abortSignal => {
+        const image = Object.create(this.docker!.getImage(spec.image)) as Docker.Image;
+        const modem = this.docker!.modem;
+        // Dockerode 5 leaves the signal out of an image inspection; forward it without changing the shared modem.
+        const imageModem = Object.create(modem) as Docker['modem'];
+        image.modem = imageModem;
+        imageModem.dial = (
+          options: Parameters<Docker['modem']['dial']>[0],
+          callback: Parameters<Docker['modem']['dial']>[1],
+        ) => modem.dial({ ...options, abortSignal }, callback);
+        return image.inspect({ abortSignal } as Docker.ImageInspectOptions);
+      }, 'an image inspection').then(
+        () => true,
+        (error: unknown) => {
+          if ((error as { statusCode?: number } | null)?.statusCode !== 404) throw error;
+          return false;
+        },
+      );
       if (!cached) {
         this.logger.log(`Pulling image: ${spec.image}`);
-        await new Promise<void>((resolve, reject) => {
-          void this.docker!.pull(spec.image, (err: Error | null, stream: NodeJS.ReadableStream) => {
-            if (err) return reject(err);
-            this.docker!.modem.followProgress(stream, (err2: Error | null) => {
-              if (err2) return reject(err2);
-              resolve();
-            });
-          });
-        });
+        let activePullStream: (NodeJS.ReadableStream & { destroy?: () => void }) | undefined;
+        await this.raceTimeout(
+          new Promise<void>((resolve, reject) => {
+            void this.docker!.pull(
+              spec.image,
+              (err: Error | null, stream: NodeJS.ReadableStream & { destroy?: () => void }) => {
+                if (err) return reject(err);
+                activePullStream = stream;
+                this.docker!.modem.followProgress(stream, (err2: Error | null) => {
+                  if (err2) return reject(err2);
+                  resolve();
+                });
+              },
+            );
+          }),
+          this.pullTimeoutMs,
+          `pulling image ${spec.image}`,
+          () => activePullStream?.destroy?.(),
+        );
       }
 
       // Create volume if needed
       if (spec.volumes) {
         for (const vol of spec.volumes) {
           try {
-            await this.docker.createVolume({ Name: vol.name });
+            await this.raceTimeout(
+              this.docker.createVolume({ Name: vol.name }),
+              this.callTimeoutMs,
+              `creating volume ${vol.name}`,
+            );
             this.logger.log(`Created volume: ${vol.name}`);
           } catch (error) {
             this.logger.debug(`Volume ${vol.name} creation skipped (may already exist)`, { error: String(error) });
@@ -493,6 +644,10 @@ export class DockerService implements OnModuleInit {
           RestartPolicy: { Name: 'unless-stopped' },
           Binds: spec.volumes?.map(v => `${v.name}:${v.path}`),
           SecurityOpt: spec.securityOpt,
+          CapDrop: spec.capDrop,
+          ...(spec.capAdd ? { CapAdd: spec.capAdd } : {}),
+          Memory: spec.memoryBytes,
+          PidsLimit: spec.pidsLimit,
         },
         Healthcheck: spec.healthcheck
           ? {
@@ -511,8 +666,12 @@ export class DockerService implements OnModuleInit {
         },
       };
 
-      const container = await this.docker.createContainer(containerConfig);
-      await container.start();
+      const container = await this.raceTimeout(
+        this.docker.createContainer(containerConfig),
+        this.callTimeoutMs,
+        `creating container ${spec.name}`,
+      );
+      await this.raceTimeout(container.start(), this.callTimeoutMs, `starting container ${spec.name}`);
       this.logger.log(`Created and started container: ${spec.name}`);
       return true;
     } catch (error) {
@@ -547,14 +706,14 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const info = await container.inspect();
+      const info = await this.answered(abortSignal => container.inspect({ abortSignal }), 'a container inspection');
       this.warnOnImageDrift(profile, info.Name?.replace(/^\//, '') || service, info);
       if (info.State.Running) {
         this.logger.log(`Service '${service}' is already running`);
         return true;
       }
 
-      await container.start();
+      await this.raceTimeout(container.start(), this.callTimeoutMs, `starting service ${service}`);
       this.logger.log(`Started service: ${service}`);
       return true;
     } catch (error) {
@@ -599,7 +758,10 @@ export class DockerService implements OnModuleInit {
    * the role only when the data volume is first initialized, so a recreated container still
    * authenticates with the password stored in the volume. Change it with `ALTER ROLE openwa
    * PASSWORD '...'` in the running container, or re-initialize the volume (which discards the data).
-   * Redis runs without credentials. To reclaim disk space, remove the container manually.
+   * Redis reads REDIS_PASSWORD from its container environment on creation (--requirepass when set,
+   * passwordless when unset): after changing REDIS_PASSWORD, remove the container (`docker rm <name>`)
+   * before re-enabling so the recreated container picks up the new password. To reclaim disk space,
+   * remove the container manually.
    */
   async stopManagedService(profile: string): Promise<boolean> {
     this.logger.log(`Stopping service with profile: ${profile} (container retained, not removed)`);
@@ -617,20 +779,28 @@ export class DockerService implements OnModuleInit {
    * Stop a container by service name (without removing)
    */
   async stopService(service: string): Promise<boolean> {
-    const container = await this.getContainerByService(service);
+    let container: Docker.Container | null;
+    try {
+      container = await this.findContainerByService(service);
+    } catch (error) {
+      // A daemon that could not say whether the container exists is not "already gone": a restart would report a
+      // still-running datastore as stopped.
+      this.logger.error(`Failed to look up service '${service}' to stop it`, error);
+      return false;
+    }
     if (!container) {
       this.logger.warn(`Container for service '${service}' not found`);
       return true; // Already doesn't exist
     }
 
     try {
-      const info = await container.inspect();
+      const info = await this.answered(abortSignal => container.inspect({ abortSignal }), 'a container inspection');
       if (!info.State.Running) {
         this.logger.log(`Service '${service}' is already stopped`);
         return true;
       }
 
-      await container.stop();
+      await this.raceTimeout(container.stop(), this.stopTimeoutMs, `stopping service ${service}`);
       this.logger.log(`Stopped service: ${service}`);
       return true;
     } catch (error) {

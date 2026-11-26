@@ -7,8 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { isUUID } from 'class-validator';
-import { EntityTarget, EntityManager, In, IsNull, Repository, DataSource } from 'typeorm';
+import { EntityTarget, EntityManager, In, IsNull, Raw, Repository, DataSource } from 'typeorm';
 import { Session, SessionStatus } from './entities/session.entity';
 import { Message } from '../message/entities/message.entity';
 import { MessageBatch } from '../message/entities/message-batch.entity';
@@ -19,6 +18,7 @@ import { WebhookOutboxEvent } from '../webhook/entities/webhook-outbox-event.ent
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
 import { Template } from '../template/entities/template.entity';
+import { AutomationRule } from '../automation/entities/automation-rule.entity';
 import { BaileysStoredMessage } from '../../engine';
 import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
@@ -27,6 +27,7 @@ import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
 import { EngineFactory } from '../../engine/engine.factory';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
 import { SessionErrorStore } from './session-error-store.service';
 import { SessionRestrictionStore } from './session-restriction-store.service';
 import { PresenceStore } from './presence-store.service';
@@ -34,6 +35,8 @@ import { type createLogger } from '../../common/services/logger.service';
 import { HookManager } from '../../core/hooks';
 import { SessionLifecycleFences } from './session-lifecycle-fences';
 import { SessionStatusBroadcaster } from './session-status-broadcaster';
+import type { MessageProjector } from './message-projector.service';
+import { sessionNotFound } from './session-id.pipe';
 // The two pure config resolvers stay exported from the lifecycle module (its export surface is
 // unchanged — session.service re-exports them from there), so this unit imports them back. The
 // resulting import cycle is deferred-usage only — the bindings are read inside method bodies,
@@ -101,6 +104,16 @@ export function nextSqliteDeleteBatchSize(rows: number, tookMs: number): number 
   return Math.max(SESSION_DELETE_BATCH_MIN_SQLITE, Math.min(SESSION_DELETE_BATCH_SIZE_SQLITE, rows * 2, scaled));
 }
 
+/**
+ * Refuse a delete that found its claim gone. When the session row is gone too, another delete of the session removed
+ * it and nothing changed owner: the answer is the 404 the same request gets a moment later, not a 409 that points at
+ * another node. A row that is still there is held by someone else or under another claim, and stays the conflict.
+ */
+export async function refuseLostDeleteClaim(manager: EntityManager, id: string, conflict: string): Promise<never> {
+  if (!(await manager.exists(Session, { where: { id } }))) throw sessionNotFound(id);
+  throw new ConflictException(conflict);
+}
+
 /** One table's pass of the batched delete: the repository to delete from and the reader of the next page of ids. */
 type TrafficPass = { rows: Repository<{ id: string }>; next: (take: number) => Promise<string[]> };
 
@@ -115,31 +128,110 @@ export class ServerShuttingDownException extends ServiceUnavailableException {
 }
 
 /**
- * The stop marks. Each add() stamps the id afresh, even one already marked, so start() can tell a mark
- * set while it waited from one that was already there when it began.
+ * Finished marks kept per session. A session stopped again and again must not grow its list without end; the marks of
+ * operations still in flight are never counted against this, they go when their operation drops them.
+ */
+const FINISHED_MARKS_KEPT = 4;
+
+/** One mark of a session: its stamp, and whether the operation that set it is still in flight. */
+interface Mark {
+  stamp: number;
+  pending: boolean;
+}
+
+/**
+ * The stop marks. Each mark is stamped from one increasing sequence, so start() can tell a mark set while it waited from
+ * one that was already there when it began. An id stays marked while any mark is left:
+ *
+ *  - hold() is the mark of an operation in flight. The operation drops it with deleteStamped() when it fails before it
+ *    acts, or lets it stand with settle() once it is done;
+ *  - add() is a mark that stays by itself until a start or a committed delete clears it: a stop that finished, a
+ *    teardown, a refused rebind.
+ *
+ * An operation that fails therefore takes only its own mark, a stop that is still waiting keeps its guard however many
+ * later operations come and go, and a session found gone can be cleared of the marks of operations that ended.
  */
 export class StopMarks extends Set<string> {
   private seq = 0;
-  private readonly stamps = new Map<string, number>();
+  private readonly marks = new Map<string, Mark[]>();
 
   override add(id: string): this {
-    this.stamps.set(id, ++this.seq);
-    return super.add(id);
+    this.push(id, false);
+    return this;
   }
 
+  /** The mark of an operation in flight; returns its stamp. */
+  hold(id: string): number {
+    return this.push(id, true);
+  }
+
+  /** The operation that held this mark is done: the mark stays as finished state. */
+  settle(id: string, stamp: number): void {
+    const marks = this.marks.get(id);
+    const mark = marks?.find(other => other.stamp === stamp);
+    if (!marks || !mark) return;
+    mark.pending = false;
+    this.trim(id, marks);
+  }
+
+  /** Every mark of the id. */
   override delete(id: string): boolean {
-    this.stamps.delete(id);
+    this.marks.delete(id);
     return super.delete(id);
   }
 
-  /** The stamp of the id's current mark, undefined when it has none. */
+  /** Drops the mark with this stamp; the id is unmarked once none is left. False when no mark has the stamp. */
+  deleteStamped(id: string, stamp: number): boolean {
+    const marks = this.marks.get(id);
+    const index = marks?.findIndex(mark => mark.stamp === stamp) ?? -1;
+    if (!marks || index < 0) return false;
+    marks.splice(index, 1);
+    if (marks.length === 0) this.delete(id);
+    return true;
+  }
+
+  /** Drops the marks of operations that are done; the id stays marked for those still in flight. */
+  dropFinished(id: string): void {
+    const inFlight = this.marks.get(id)?.filter(mark => mark.pending) ?? [];
+    if (inFlight.length === 0) this.delete(id);
+    else this.marks.set(id, inFlight);
+  }
+
+  /** The stamp of the id's newest mark, undefined when it has none. */
   stamp(id: string): number | undefined {
-    return this.stamps.get(id);
+    return this.marks.get(id)?.at(-1)?.stamp;
+  }
+
+  /**
+   * Whether the id has a mark newer than `seen`, the newest stamp the caller saw when it began (undefined: none). A mark
+   * that was there then and still is does not count, nor does one that remains after a newer mark was dropped.
+   */
+  markedSince(id: string, seen: number | undefined): boolean {
+    const newest = this.stamp(id);
+    return newest !== undefined && (seen === undefined || newest > seen);
+  }
+
+  private push(id: string, pending: boolean): number {
+    const marks = this.marks.get(id) ?? [];
+    const stamp = ++this.seq;
+    marks.push({ stamp, pending });
+    this.trim(id, marks);
+    super.add(id);
+    return stamp;
+  }
+
+  /** Keeps every mark in flight and only the newest few that are done. */
+  private trim(id: string, marks: Mark[]): void {
+    let finished = marks.filter(mark => !mark.pending).length;
+    const kept = marks.filter(mark => mark.pending || finished-- <= FINISHED_MARKS_KEPT);
+    this.marks.set(id, kept);
   }
 }
 
-/** Caller callbacks for stop()/delete(), run around the session read that opens each verb. */
+/** Caller callbacks for stop(), delete(), forceKill() and logout(), run around the session read that opens each verb. */
 export interface StopHooks {
+  /** stop() and delete(): the stamp of the stop mark the caller set for this call, which a failed first read drops. */
+  mark?: number;
   /** delete() only: the ownership captured by its caller still covers this operation. */
   ownsClaim?: () => boolean;
   /** stop() only: runs once the session read succeeds and before any teardown; records the stop. */
@@ -149,7 +241,7 @@ export interface StopHooks {
    * withdraws the caller's stop request.
    */
   onReadFailed?: () => void;
-  /** forceKill() only: runs synchronously once there is an engine to kill; records the stop request. */
+  /** forceKill()/logout(): runs synchronously once there is an engine to retire. */
   onEngineFound?: () => void;
   /** forceKill() only: persist the stop with the caller's current ownership predicate. */
   recordStop?: () => Promise<void>;
@@ -178,9 +270,22 @@ export interface SessionEngineControlsHost {
   sessionErrors: SessionErrorStore;
   sessionRestrictions: SessionRestrictionStore;
   presence: PresenceStore;
+  projector?: Partial<Pick<MessageProjector, 'forgetSession'>>;
   hookManager: HookManager;
   configService?: ConfigService;
   nodeId?: string;
+  /** Same contract as SessionEngineWiringHost.bindingEpoch. */
+  bindingEpoch(id: string): number;
+  forgetBindingEpoch?(id: string): void;
+  /** delete(), once the row is removed: the claim guards nothing from there on (SessionOwnershipService.forget). */
+  forgetClaim?(id: string, ownsClaim?: () => boolean): void;
+  /**
+   * `read`, once the phone writes this process issued (an unlink's clear, the number and push name a READY links, the
+   * clear of a logout) have been answered: a row read that overlaps one can return the binding it replaces.
+   */
+  readAfterPhoneWrites?<T>(id: string, read: () => Promise<T>): Promise<T>;
+  /** `write`, a change to the session's phone, issued in order with those writes. The caller awaits its answer. */
+  writePhone?<T>(id: string, write: () => Promise<T>): Promise<T>;
   logger: ReturnType<typeof createLogger>;
   /** LIVE closure — read at call time, never captured (specs replace lifecycle.dataSource at runtime). */
   dataSource(): DataSource;
@@ -191,13 +296,13 @@ export interface SessionEngineControlsHost {
   isSessionRetired(id: string): Promise<boolean>;
   prepareStart(id: string, desiredState: Session['desiredState']): Promise<boolean>;
   purgeAuthDirsIfDeleted(id: string): Promise<void>;
-  updateStatus(id: string, status: SessionStatus): Promise<void>;
+  updateStatus(id: string, status: SessionStatus, options?: { allowUnowned?: boolean }): Promise<boolean | void>;
   /** Ownership gate, same contract as SessionEngineWiringHost.ownsSession. */
   ownsSession(id: string): boolean;
   /** True once shutdown() has begun; the lifecycle never reopens. */
   isClosed(): boolean;
   stoppingSessions: StopMarks;
-  /** The engine each operator-initiated teardown is retiring; see the lifecycle field of the same name. */
+  /** The engine each teardown that writes its own status is retiring; see the lifecycle field of the same name. */
   operatorTeardowns: Map<string, IWhatsAppEngine>;
   reconnectStates: Map<string, ReconnectState>;
   stuckAuthRecoveryUsed: Set<string>;
@@ -282,7 +387,7 @@ export class SessionEngineControls {
   private async requireSession(id: string): Promise<Session> {
     const session = await this.sessionRepository.findOne({ where: { id } });
     if (!session) {
-      throw new NotFoundException(`Session with id '${id}' not found`);
+      throw sessionNotFound(id);
     }
     return this.sessionRestrictions.attachTo(this.sessionErrors.attachTo(session));
   }
@@ -292,11 +397,19 @@ export class SessionEngineControls {
    * that fails has retired nothing, so the mark must not outlive it: left on a running session, its
    * next disconnect would never reconnect and start() would keep refusing it as already started.
    */
-  private async requireSessionOrDropStopMark(id: string, onReadFailed?: () => void): Promise<Session> {
+  private async requireSessionOrDropStopMark(
+    id: string,
+    mark: number | undefined,
+    onReadFailed?: () => void,
+  ): Promise<Session> {
     try {
       return await this.requireSession(id);
     } catch (error) {
-      this.stoppingSessions.delete(id);
+      // Only the mark this call's caller set: one a later stop or delete set meanwhile still guards its own operation.
+      if (mark === undefined) this.stoppingSessions.delete(id);
+      else this.stoppingSessions.deleteStamped(id, mark);
+      // A session with no row has nothing left for the marks of finished operations to guard.
+      if (error instanceof NotFoundException) this.stoppingSessions.dropFinished(id);
       onReadFailed?.();
       throw error;
     }
@@ -329,6 +442,8 @@ export class SessionEngineControls {
     // above all, which writes nothing else this start could read and counts on it aborting. That
     // includes a mark set again on top of a stale one, which only its stamp tells apart.
     const markAtEntry = this.stoppingSessions.stamp(id);
+    // A WhatsApp unlink recorded after this point clears the binding either read below may still return.
+    const bindingEpoch = this.host.bindingEpoch(id);
 
     try {
       const session = await this.requireSession(id);
@@ -371,6 +486,11 @@ export class SessionEngineControls {
       // initializingSessions reservation added synchronously at start() entry: its finally removes it
       // again, so a refused start does not leave a false "already starting" mark behind (briefly held).
       await this.fences.awaitPendingTeardown(session.name);
+      // A reconnect waiting on the same teardown resumes first and launches its engine; launching another over
+      // it would push it out of the registry while it runs. Refused before anything below is touched.
+      if (this.engines.has(id)) {
+        throw new BadRequestException('Session is already started');
+      }
 
       // A delete still running outranks every start, however long it has run: the mark it set is not a
       // stale one, and clearing it below would let an engine start under the delete that is removing the
@@ -381,7 +501,7 @@ export class SessionEngineControls {
 
       // A fresh start intentionally (re-)creates the engine — clear any stale stop/delete mark, but
       // yield to one set after this start began, leaving it in place.
-      if (this.stoppingSessions.has(id) && this.stoppingSessions.stamp(id) !== markAtEntry) {
+      if (this.stoppingSessions.markedSince(id, markAtEntry)) {
         throw new SessionStoppedException(`Session ${id} was stopped`);
       }
       this.stoppingSessions.delete(id);
@@ -399,7 +519,11 @@ export class SessionEngineControls {
       // mark again and retires this start after its init. A launch that fails after the clear still
       // counts as the start the operator asked for. A delete issued since this start began that failed once it
       // began removing has dropped its mark and left a record this start may have read too: it still stands.
-      const { desiredState } = await this.requireSession(id);
+      // It also supplies the binding the engine checks, so it is read once the phone writes of an unlink, a READY or a
+      // logout have been answered, and again when one is issued while it runs.
+      const readCurrent = (): Promise<Session> => this.requireSession(id);
+      const current = await (this.host.readAfterPhoneWrites?.(id, readCurrent) ?? readCurrent());
+      const { desiredState } = current;
       if ((desiredState && (!explicit || desiredState !== session.desiredState)) || stoppedSince?.()) {
         this.stoppingSessions.add(id);
         throw new SessionStoppedException(`Session ${id} was stopped`);
@@ -470,7 +594,10 @@ export class SessionEngineControls {
       // The catch must use this capture, not a later lookup: a disconnect of this engine mid-init can
       // schedule a reconnect that registers a replacement before initialize() rejects.
       const before = this.engines.get(id);
-      const init = this.host.initializeEngine(id, session);
+      // The binding the engine checks comes from the read past the teardown fence, and none at all once a WhatsApp
+      // unlink was recorded since this start began: the number that scans next must not be refused as a rebind.
+      const phone = this.host.bindingEpoch(id) === bindingEpoch ? current.phone : null;
+      const init = this.host.initializeEngine(id, { ...session, phone });
       const registered = this.engines.get(id);
       const mine = registered !== before ? registered : undefined;
       let failedWritten = false;
@@ -558,18 +685,15 @@ export class SessionEngineControls {
   }
 
   /**
-   * Tears down the engine a start registered for a session that was stopped or deleted meanwhile, and drops
-   * the reconnect state it armed for it.
+   * Tears down the engine a start registered for a session that was stopped or deleted meanwhile, or whose
+   * claim this node lost, and drops the reconnect state it armed for it.
    */
   private async reapRetiredEngine(
     id: string,
     resurrected: IWhatsAppEngine | undefined,
     reconnectState?: ReconnectState,
   ): Promise<void> {
-    if (resurrected && this.engines.isLive(id, resurrected)) {
-      await this.fences.destroyWithEscalation(id, resurrected);
-      this.engines.deleteIfLive(id, resurrected);
-    }
+    if (resurrected) await this.retireLaunchedEngine(id, resurrected);
     // The reconnect state this start armed up front serves no engine now, and the stop or delete that retired it
     // may have run before the state was armed, so nothing else would drop it. A replacement engine that
     // registered meanwhile keeps its own.
@@ -581,8 +705,43 @@ export class SessionEngineControls {
     await this.host.purgeAuthDirsIfDeleted(id);
   }
 
+  /**
+   * Tear down the engine a start or a reconnect registered for a session retired while it initialized: a
+   * stop, a delete, or a claim this node no longer holds. The read that found the claim gone is newer than
+   * the in-memory ownership the engine callbacks are fenced on, so the engine's own DISCONNECTED report is
+   * held back like an operator teardown's, and the status is written instead only on a row that is still
+   * this node's or has no owner: a peer's row keeps the status its own engine gave it (INV-6).
+   */
+  async retireLaunchedEngine(id: string, engine: IWhatsAppEngine): Promise<void> {
+    if (!this.engines.isLive(id, engine)) return;
+    this.operatorTeardowns.set(id, engine);
+    try {
+      await this.fences.destroyWithEscalation(id, engine);
+      this.engines.deleteIfLive(id, engine);
+    } finally {
+      if (this.operatorTeardowns.get(id) === engine) this.operatorTeardowns.delete(id);
+    }
+    const nodeId = this.host.nodeId;
+    const ours =
+      nodeId === undefined
+        ? { id }
+        : [
+            { id, nodeId },
+            { id, nodeId: IsNull() },
+          ];
+    try {
+      const { affected } = await this.sessionRepository.update(ours, { status: SessionStatus.DISCONNECTED });
+      if (affected) this.broadcaster.announce(id, SessionStatus.DISCONNECTED);
+    } catch (error) {
+      this.logger.warn('Failed to persist the disconnected status of a retired launch', {
+        sessionId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   async stop(id: string, hooks: StopHooks = {}): Promise<Session> {
-    const session = await this.requireSessionOrDropStopMark(id, hooks.onReadFailed);
+    const session = await this.requireSessionOrDropStopMark(id, hooks.mark, hooks.onReadFailed);
     // Recorded only once the row is known to exist, and before anything is torn down.
     await hooks.afterRead?.();
 
@@ -624,7 +783,7 @@ export class SessionEngineControls {
           // settled (Map reconciled, status DISCONNECTED — mirroring logout()'s incomplete path), but
           // the stop is reported as incomplete instead of claimed clean: a retryable 502 with a stable
           // code, and no success log (the controller audits SESSION_STOPPED only after this resolves).
-          await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+          await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
           throw new BadGatewayException({
             statusCode: HttpStatus.BAD_GATEWAY,
             message:
@@ -646,7 +805,7 @@ export class SessionEngineControls {
       sessionId: id,
       action: 'stop',
     });
-    await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+    await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
     return this.requireSession(id);
   }
 
@@ -677,19 +836,25 @@ export class SessionEngineControls {
    * Throws a retryable BadGatewayException (502) carrying a stable `code: 'SESSION_LOGOUT_INCOMPLETE'`
    * when an accepted engine-backed attempt stopped locally but the unlink operation did NOT complete
    * — no identity/no send, no IQ acknowledgement, timeout/transport error, OR local credential
-   * cleanup failure. After EVERY engine-backed attempt (200 OR 502) the session is torn down locally
+   * cleanup failure. A Baileys session with no linked device has nothing to unlink, so its engine refuses
+   * with EngineNotReadyError, answered as that 409 after the same local teardown rather than as a 502
+   * whose retry could only repeat. After EVERY engine-backed attempt (200, 409 OR 502) the session is torn down locally
    * (map reconciled, status DISCONNECTED) and `phone` is cleared so the boot auto-start does not
    * resurrect the session into an uncertain/invalid credential state. No success audit is written on
    * the 502 path (the controller audits SESSION_LOGGED_OUT only after the service resolves). The
    * operator can start the session and retry the logout.
    */
-  async logout(id: string): Promise<Session> {
-    const session = await this.requireSession(id);
+  async logout(id: string, hooks: StopHooks = {}): Promise<Session> {
+    const session = await this.requireSession(id).catch((error: unknown) => {
+      hooks.onReadFailed?.();
+      throw error;
+    });
     const engine = this.engines.get(id);
 
     if (!engine) {
       throw new BadRequestException('Session is not started. Call POST /sessions/:sessionId/start first.');
     }
+    hooks.onEngineFound?.();
 
     // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
     this.stoppingSessions.add(id);
@@ -699,6 +864,20 @@ export class SessionEngineControls {
     // Announced by the write below rather than from the engine callback, as in stop().
     this.operatorTeardowns.set(id, engine);
     let unlinked: boolean;
+    // The teardown helper keeps only whether the call settled; the engine's refusal of a session with no
+    // linked device is kept here so it can answer instead of the 502.
+    let neverLinked: EngineNotReadyError | undefined;
+    let releaseTeardown!: () => void;
+    let teardownLaunched = false;
+    // Register in pendingTeardowns synchronously before yielding on awaitInitialStatus so a
+    // concurrent delete() that evicts engine while awaitInitialStatus is suspended still observes
+    // this logout at Fence #2.
+    this.fences.trackPendingCredentialTeardown(
+      session.name,
+      new Promise<void>(resolve => {
+        releaseTeardown = resolve;
+      }),
+    );
     try {
       // Await THIS engine's in-flight INITIALIZING write before teardown / the final DISCONNECTED
       // write so a delayed pre-initialize status update can never settle after the retirement.
@@ -706,7 +885,21 @@ export class SessionEngineControls {
       // The credential fence is keyed by session NAME (see awaitPendingTeardown). Captured immutably
       // here so a raw logout that outlives its deadline race is tracked under the right name even if
       // the row is later deleted/recreated.
-      unlinked = await this.fences.teardownEngineSafely(id, engine, e => e.logout(), 'logout', session.name);
+      unlinked = await this.fences.teardownEngineSafely(
+        id,
+        engine,
+        e => {
+          const raw = e.logout().catch((error: unknown) => {
+            if (error instanceof EngineNotReadyError) neverLinked = error;
+            throw error;
+          });
+          teardownLaunched = true;
+          void raw.then(releaseTeardown, releaseTeardown);
+          return raw;
+        },
+        'logout',
+        session.name,
+      );
       this.engines.deleteIfLive(id, engine);
       // Clear `phone` AFTER the attempt, whatever its outcome, to take the session out of the boot
       // auto-start query (phone IS NOT NULL). A completed engine-backed unlink wipes the stored
@@ -714,14 +907,29 @@ export class SessionEngineControls {
       // incomplete one tore the local credentials down, so re-entering auto-start would only wedge it.
       // Before the status write, so a failed status write cannot leave the flag behind and resurrect
       // the session into a QR it can never pass on every restart. onReady rewrites it on the next link.
-      await this.sessionRepository.update(id, { phone: null });
-      await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+      // Issued in the step that evicts the engine: a start that finds none registered reads the row only once this
+      // clear has been answered, and a READY's number still waiting on an earlier write goes in before it.
+      const nodeId = this.host.nodeId;
+      const phoneWhere =
+        nodeId === undefined
+          ? id
+          : [
+              { id, nodeId },
+              { id, nodeId: IsNull() },
+            ];
+      const clearPhone = (): Promise<unknown> => this.sessionRepository.update(phoneWhere, { phone: null });
+      await (this.host.writePhone?.(id, clearPhone) ?? clearPhone());
+      await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
     } finally {
+      if (!teardownLaunched) {
+        releaseTeardown();
+      }
       if (this.operatorTeardowns.get(id) === engine) {
         this.operatorTeardowns.delete(id);
       }
     }
 
+    if (neverLinked) throw neverLinked;
     if (!unlinked) {
       this.logger.warn(`Session stopped locally but the logout operation did not complete: ${session.name}`, {
         sessionId: id,
@@ -801,7 +1009,7 @@ export class SessionEngineControls {
       if (!tornDown) {
         // As in stop(): local state is settled, but a kill that may have left the process alive is
         // reported as incomplete, not claimed clean (the controller audits only after a resolve).
-        await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+        await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
         throw new BadGatewayException({
           statusCode: HttpStatus.BAD_GATEWAY,
           message:
@@ -816,7 +1024,7 @@ export class SessionEngineControls {
         sessionId: id,
         action: 'force_kill',
       });
-      await this.host.updateStatus(id, SessionStatus.DISCONNECTED);
+      await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true });
     } finally {
       if (this.operatorTeardowns.get(id) === engine) {
         this.operatorTeardowns.delete(id);
@@ -826,7 +1034,7 @@ export class SessionEngineControls {
   }
 
   async delete(id: string, hooks: StopHooks = {}): Promise<void> {
-    const session = await this.requireSessionOrDropStopMark(id, hooks.onReadFailed);
+    const session = await this.requireSessionOrDropStopMark(id, hooks.mark, hooks.onReadFailed);
 
     // FENCE #1 — fail-fast on an ALREADY-PENDING credential teardown for this session NAME, BEFORE
     // any lifecycle mutation. A logout teardown that lost its deadline race is still running and ends
@@ -838,7 +1046,9 @@ export class SessionEngineControls {
     await this.fences.awaitPendingTeardown(session.name);
 
     // Mark as tearing down BEFORE cleanup so an in-flight reconnect can't resurrect it.
-    this.stoppingSessions.add(id);
+    // Held, not added: it goes with this delete unless the row is removed, and must not push a stop that finished out of
+    // the finished marks meanwhile.
+    const ownMark = this.stoppingSessions.hold(id);
     // Cancel any reconnection attempts
     this.host.cancelReconnect(id);
 
@@ -881,7 +1091,7 @@ export class SessionEngineControls {
         await this.fences.awaitPendingTeardown(session.name);
       } catch (fenceError) {
         if (engine) {
-          await this.host.updateStatus(id, SessionStatus.DISCONNECTED).catch(() => undefined);
+          await this.host.updateStatus(id, SessionStatus.DISCONNECTED, { allowUnowned: true }).catch(() => undefined);
         }
         throw fenceError;
       }
@@ -934,6 +1144,7 @@ export class SessionEngineControls {
         await manager.delete(StatusUpdate, { sessionId: id });
         await manager.delete(Webhook, { sessionId: id });
         await manager.delete(Template, { sessionId: id });
+        await manager.delete(AutomationRule, { sessionId: id });
         await manager.delete(BaileysStoredMessage, { sessionId: id });
         await manager.delete(WebhookOutboxEvent, { sessionId: id });
         await manager.delete(WebhookDeliveryFailure, { sessionId: id });
@@ -942,6 +1153,9 @@ export class SessionEngineControls {
         await manager.remove(session);
       });
       parentDeleted = true;
+      // The row is gone, so the claim on it guards nothing: a heartbeat tick during the credential purge would read
+      // the missing row as a claim a peer took, and tear down a session this delete already removed.
+      this.host.forgetClaim?.(id, hooks.ownsClaim);
       this.logger.log(`Session deleted: ${session.name}`, {
         sessionId: id,
         action: 'delete',
@@ -957,14 +1171,16 @@ export class SessionEngineControls {
       // carried before 0.23.5, and the boot migration keeps a legacy one it could not rename. Unless
       // it is another session's id, whatever its shape (an import accepts any safe key): the dirs it
       // names are then that session's live login, the same exact-id guard the migration keeps. A
-      // failed lookup withholds the name rather than fail a delete that has already committed. On
-      // PostgreSQL the id column is a uuid, so a name of any other shape is no session's id there, and
-      // looking it up would fail rather than miss.
+      // failed lookup withholds the name rather than fail a delete that has already committed. The id
+      // column is varchar on PostgreSQL too (an import keeps any safe key), so a name of any shape can be
+      // a session's id there; it is compared as text, so only a name that really is an id withholds itself.
       // Keyed by `id`, not `session.id`: TypeORM clears a removed entity's primary key, so session.id
       // is undefined here and the purge would refuse it as an unsafe key and remove nothing.
-      const nameIsAnId =
-        (dataSource.options.type !== 'postgres' || isUUID(session.name)) &&
-        (await this.sessionRepository.exists({ where: { id: session.name } }).catch(() => true));
+      const legacyId =
+        dataSource.options.type === 'postgres'
+          ? Raw(alias => `CAST(${alias} AS text) = :legacyId`, { legacyId: session.name })
+          : session.name;
+      const nameIsAnId = await this.sessionRepository.exists({ where: { id: legacyId } }).catch(() => true);
       await this.engineFactory.purgeSessionData(id, nameIsAnId ? undefined : session.name);
     } catch (error) {
       // The session survives, but the write scopes closed above stay retired for good: a bulk batch
@@ -975,32 +1191,48 @@ export class SessionEngineControls {
     } finally {
       writes.release();
       endDelete();
-      // Always clear the teardown mark so a later recreate/start with this id isn't suppressed. This
-      // stop mark was set after fence #1, so clearing it on a rejected 409 only undoes what THIS
-      // delete added — it does NOT touch reconnect timer / engine / last status / error / recovery
-      // state (those are gated on parentDeleted below).
-      this.stoppingSessions.delete(id);
+      // Clear the teardown mark so a later recreate/start with this id isn't suppressed. This stop mark
+      // was set after fence #1, so clearing it on a rejected 409 only undoes what THIS delete added — it
+      // does NOT touch reconnect timer / engine / last status / error / recovery state (those are gated
+      // on parentDeleted below). A delete that did not remove the row clears only the marks it set: a
+      // stop that began meanwhile holds a mark of its own, and that mark still guards the stop. Once the row
+      // is gone nothing is left for a mark to guard, whoever set it.
       if (parentDeleted) {
-        this.broadcaster.clear(id);
-        // Drop the FAILED-reason entry too: it's keyed by a now-deleted UUID that can never be read
-        // again, so leaving it would grow the map without bound across create/fail/delete churn.
-        this.sessionErrors.clear(id);
-        // Same unbounded-growth argument for the restriction entry, and the gauge it feeds must not
-        // keep counting an account whose session no longer exists.
-        this.sessionRestrictions.clear(id);
-        // Presence is per-connection state that the deleted session can never receive again, and it
-        // is keyed by an id that will never be read.
-        this.presence.clear(id);
-        // The stuck-auth recovery budget is keyed by id; a committed delete frees it (and a recreated
-        // session under the same name gets a fresh UUID + fresh budget). Left only on a committed
-        // delete so a failed/409 delete — the session still exists — keeps the budget intact.
-        this.stuckAuthRecoveryUsed.delete(id);
+        this.stoppingSessions.delete(id);
+      } else {
+        // Both marks of this delete: the one its caller set before the call and the one it set itself.
+        this.stoppingSessions.deleteStamped(id, ownMark);
+        if (hooks.mark !== undefined) this.stoppingSessions.deleteStamped(id, hooks.mark);
       }
+      if (parentDeleted) this.forgetSession(id);
       // NOTE: pendingTeardowns is intentionally NOT cleared here. It is keyed by session NAME and
       // its entries self-remove on settlement (identity-checked). A delete that refused at either
       // fence MUST leave the entry in place — the name is still reserved against the live remover —
       // and a delete that succeeded already saw both fences pass, so no live remover exists.
     }
+  }
+
+  /**
+   * Drop what this process keeps in memory for a session whose row is gone: by a committed delete, or by an infra import
+   * that replaced the table without it. Never for a session that still exists.
+   */
+  forgetSession(id: string): void {
+    this.broadcaster.clear(id);
+    // Drop the FAILED-reason entry too: it's keyed by a now-deleted UUID that can never be read
+    // again, so leaving it would grow the map without bound across create/fail/delete churn.
+    this.sessionErrors.clear(id);
+    // Same unbounded-growth argument for the restriction entry, and the gauge it feeds must not
+    // keep counting an account whose session no longer exists.
+    this.sessionRestrictions.clear(id);
+    // Presence is per-connection state that the deleted session can never receive again, and it
+    // is keyed by an id that will never be read.
+    this.presence.clear(id);
+    // The stuck-auth recovery budget is keyed by id; a committed delete frees it (and a recreated
+    // session under the same name gets a fresh UUID + fresh budget). Left only on a committed
+    // delete so a failed/409 delete (the session still exists) keeps the budget intact.
+    this.stuckAuthRecoveryUsed.delete(id);
+    this.host.forgetBindingEpoch?.(id);
+    this.host.projector?.forgetSession?.(id);
   }
 
   /**
@@ -1109,10 +1341,15 @@ export class SessionEngineControls {
           .set({ nodeId: this.host.nodeId, updatedAt: () => '"updatedAt"' })
           .where({ id: session.id, nodeId: this.host.nodeId, claimedAt: session.claimedAt ?? IsNull() })
           .execute();
-        if (affected !== 1) throw new ConflictException(`Session ${session.id} is no longer owned by this node`);
+        if (affected !== 1) {
+          return refuseLostDeleteClaim(manager, session.id, `Session ${session.id} is no longer owned by this node`);
+        }
       }
-      if (ownsClaim?.() === false)
+      // A delete holds a claim only where ownership is wired, so the update above matched the row and locked it: the
+      // row is still there, and a claim this delete lost is a conflict, never a 404.
+      if (ownsClaim?.() === false) {
         throw new ConflictException(`Session ${session.id} is no longer owned by this delete`);
+      }
       await remove(manager);
     });
   }
@@ -1230,13 +1467,10 @@ export class SessionEngineControls {
           return;
         }
         try {
-          const tornDown = await this.fences.destroyWithEscalation(id, engine);
-          // The engine leaves the Map regardless of teardown outcome so it stops holding a
-          // concurrency slot — but only a completed teardown counts as `stopped`. A throw/timeout
-          // means the Chromium/socket may still be alive and writing, so the id lands in `failed`
-          // and the caller (the infra import) can flag restartRequired instead of reporting a
-          // clean stop for a wedged engine.
+          // Evict from the live registry before teardown settles so concurrent callers stop seeing
+          // or reusing the departing engine immediately.
           this.engines.deleteIfLive(id, engine);
+          const tornDown = await this.fences.destroyWithEscalation(id, engine);
           if (tornDown) {
             stopped.push(id);
           } else {

@@ -1,4 +1,8 @@
 import 'reflect-metadata';
+import { NotImplementedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import type { HttpAdapterHost } from '@nestjs/core';
+import { Subject } from 'rxjs';
 import { DataSource, type QueryDeepPartialEntity } from 'typeorm';
 import { Message, MessageDirection } from '../../../modules/message/entities/message.entity';
 import { Session } from '../../../modules/session/entities/session.entity';
@@ -239,6 +243,27 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     expect((await provider.search({ q: 'hello', chatIds: ['c2'], sessionIds: ['s1'] })).total).toBe(0);
   });
 
+  // The documented direction of the match=word score on SQLite: FTS5's bm25 rank, negative, lower for the
+  // more relevant hit, which comes first. PostgreSQL's ts_rank runs the other way.
+  it('reports the word score as the FTS5 rank: negative, lowest for the most relevant hit', async () => {
+    await ds.getRepository(Message).insert({
+      sessionId: 's1',
+      chatId: 'c1',
+      from: 'a@c.us',
+      to: 'dest@c.us',
+      body: 'hello hello hello',
+      type: 'text',
+      direction: MessageDirection.OUTGOING,
+      timestamp: 1,
+    });
+
+    const { hits } = await provider.search({ q: 'hello' });
+    const scores = hits.map(hit => hit.score as number);
+    expect(hits[0].body).toBe('hello hello hello');
+    expect(scores.every(score => score < 0)).toBe(true);
+    expect([...scores].sort((a, b) => a - b)).toEqual(scores);
+  });
+
   // bm25 weighs a term by how many messages the whole index holds, so the rank of a hit a session- or
   // chat-scoped caller may read still reflects sessions and chats it may not. The hits stay ordered by it;
   // the value is withheld.
@@ -384,5 +409,107 @@ describe('BuiltInFtsProvider (sqlite)', () => {
     expect(oldTerm.hits.map(h => h.body)).not.toContain('hello world');
     const newTerm = await provider.search({ q: 'goodbye' });
     expect(newTerm.hits.map(h => h.body)).toContain('goodbye updated');
+  });
+
+  describe('cooperative shutdown during trigram index build', () => {
+    const containsOn = new ConfigService({ search: { containsEnabled: true } });
+
+    it('stops trigram backfill between batches on destroy, keeps contains unavailable, and awaits the active batch', async () => {
+      const repo = ds.getRepository(Message);
+      const bulk = Array.from({ length: 2500 }, (_, i) => ({
+        sessionId: 's1',
+        chatId: 'c1',
+        from: 'a@c.us',
+        to: 'dest@c.us',
+        body: `bulk message ${i}`,
+        type: 'text' as const,
+        direction: MessageDirection.INCOMING,
+        timestamp: 100 + i,
+      }));
+      for (let i = 0; i < bulk.length; i += 200) await repo.insert(bulk.slice(i, i + 200));
+
+      const trigramProvider = new BuiltInFtsProvider(ds, containsOn);
+      const query = ds.query.bind(ds);
+      let backfillBatches = 0;
+      let releaseFirstBatch!: () => void;
+      const firstBatchGate = new Promise<void>(resolve => (releaseFirstBatch = resolve));
+      let enteredFirstBatch!: () => void;
+      const onFirstBatch = new Promise<void>(resolve => (enteredFirstBatch = resolve));
+
+      const querySpy = jest
+        .spyOn(ds, 'query')
+        .mockImplementation(async (sql: string, params?: Parameters<DataSource['query']>[1]) => {
+          if (/m\."rowid" > \?/.test(sql)) {
+            backfillBatches += 1;
+            if (backfillBatches === 1) {
+              enteredFirstBatch();
+              await firstBatchGate;
+            }
+          }
+          return query(sql, params);
+        });
+
+      const buildP = trigramProvider.buildContainsIndex();
+      await onFirstBatch;
+
+      let destroyed = false;
+      const destroyP = Promise.resolve(trigramProvider.onModuleDestroy()).then(() => {
+        destroyed = true;
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(destroyed).toBe(false);
+
+      releaseFirstBatch();
+      await destroyP;
+      await buildP;
+      querySpy.mockRestore();
+
+      expect(destroyed).toBe(true);
+      expect(backfillBatches).toBe(1);
+      await expect(trigramProvider.search({ q: 'bulk', match: 'contains' })).rejects.toBeInstanceOf(
+        NotImplementedException,
+      );
+      await expect(trigramProvider.search({ q: 'bulk', match: 'contains' })).rejects.toThrow(/still being built/);
+    });
+
+    it('does not start a trigram build when adapterHost.listen$ emits after onModuleDestroy', async () => {
+      const listen$ = new Subject<void>();
+      const adapterHost = { listening: false, listen$ } as unknown as HttpAdapterHost;
+      const trigramProvider = new BuiltInFtsProvider(ds, containsOn, adapterHost);
+      const buildSpy = jest.spyOn(trigramProvider, 'buildContainsIndex');
+
+      trigramProvider.onApplicationBootstrap();
+      await trigramProvider.onModuleDestroy();
+      listen$.next();
+      await new Promise(resolve => setImmediate(resolve));
+
+      expect(buildSpy).not.toHaveBeenCalled();
+    });
+
+    it('bounds onModuleDestroy when a trigram build query hangs', async () => {
+      jest.useFakeTimers();
+      try {
+        const hungDs = {
+          options: { type: 'better-sqlite3' },
+          query: jest.fn(() => new Promise(() => undefined)),
+        } as unknown as DataSource;
+        const trigramProvider = new BuiltInFtsProvider(hungDs, containsOn);
+
+        void trigramProvider.buildContainsIndex();
+        let destroyed = false;
+        const destroyP = Promise.resolve(trigramProvider.onModuleDestroy()).then(() => {
+          destroyed = true;
+        });
+
+        await jest.advanceTimersByTimeAsync(999);
+        expect(destroyed).toBe(false);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(destroyed).toBe(true);
+        await destroyP;
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 });

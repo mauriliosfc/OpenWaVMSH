@@ -13,6 +13,7 @@ import {
 } from './config/inflight-body-budget';
 import { ActiveKeyIndex } from './modules/auth/active-key-index';
 import { requestContextMiddleware } from './common/middleware/request-context.middleware';
+import { requestMetricsBoundaryMiddleware } from './common/middleware/request-metrics.middleware';
 import { createLogger } from './common/services/logger.service';
 import { ShutdownService } from './common/services/shutdown.service';
 import { injectDashboardCspNonce } from './config/dashboard-csp';
@@ -49,9 +50,9 @@ export interface AppliedBodyCaps {
 }
 
 /**
- * Everything the production HTTP surface installs on the Express app: request context, the CSP
- * nonce, helmet, the SPA document handler, CORS, the encoded-NUL refusal, the in-flight body budget,
- * the body parsers, the nesting-depth refusal and the trailing-slash DELETE refusal.
+ * Everything the production HTTP surface installs on the Express app: the request metrics boundary,
+ * request context, the CSP nonce, helmet, the SPA document handler, CORS, the encoded-NUL refusal, the
+ * in-flight body budget, the body parsers, the nesting-depth refusal and the trailing-slash DELETE refusal.
  *
  * It lives here rather than inside bootstrap() so the e2e lane can run the SAME stack. main.ts
  * boots on import, so a suite cannot import it; the whole stack was therefore executed by nothing,
@@ -68,6 +69,10 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
     distDir: DASHBOARD_DIST,
     enabled: dashboardServingEnabled && dashboardBuildPresent,
   };
+
+  // First, so the HTTP RED series count every API response, the ones the middleware below answers itself
+  // included (the shutdown 503, the %00 refusal, the in-flight budget, parser and nesting errors).
+  app.use('/api', requestMetricsBoundaryMiddleware);
 
   // Assign a request id to every inbound request (X-Request-ID), echo it on the response, and run
   // the whole downstream chain inside its scope so every log line + audit row carries it.
@@ -176,8 +181,16 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
     },
     credentials: corsPolicy.credentials,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    // Idempotency-Key is the opt-in retry guard on the send routes (SendIdempotencyInterceptor).
-    allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization', 'X-Request-ID', 'Idempotency-Key'],
+    // Idempotency-Key is the opt-in retry guard on the send routes (SendIdempotencyInterceptor);
+    // X-Requested-With is the dashboard CSRF defense header for cookie-authenticated mutations.
+    allowedHeaders: [
+      'Content-Type',
+      'X-API-Key',
+      'Authorization',
+      'X-Request-ID',
+      'Idempotency-Key',
+      'X-Requested-With',
+    ],
     // The throttlers are named (short/medium/long, plus ingress-ip on ingress), so @nestjs/throttler
     // suffixes every rate-limit header with the throttler name; IngressService emits the per-instance
     // bucket's headers under the same `-instance` suffix. Expose the suffixed names so browser clients
@@ -267,7 +280,7 @@ export function configureApp(app: INestApplication, options: ConfigureAppOptions
   app.use(
     createInflightBodyBudget(inflightBudgetBytes, {
       trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
-      classify: (req, clientIp) => keyIndex?.recognise(req.headers, clientIp),
+      classify: (req, clientIp) => keyIndex?.recognise(req.headers, clientIp, req.path),
       bodyLimitBytes: parseBodyLimitBytes(bodyLimit),
       requestTimeoutMs: resolveRequestTimeoutMs(process.env.REQUEST_TIMEOUT_MS),
     }).middleware,

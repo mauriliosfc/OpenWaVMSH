@@ -10,6 +10,7 @@ jest.mock('fs', () => {
   return {
     ...actual,
     writeFileSync: jest.fn(),
+    renameSync: jest.fn(),
     // saveConfig now writes the generated env via writeSecretFile, which chmods 0600 — mock it
     // so the secret-hygiene path never touches the real filesystem.
     chmodSync: jest.fn(),
@@ -27,7 +28,7 @@ jest.mock('../../config/storage-root', () => {
 });
 
 import type { Server } from 'http';
-import { BadRequestException, type INestApplication } from '@nestjs/common';
+import { BadRequestException, ConflictException, type INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
@@ -42,6 +43,7 @@ import { AuditAction } from '../audit/entities/audit-log.entity';
 import { recordOsEnvKeys, recordPinnedEnvKeys } from '../../config/env-precedence';
 import { resolveStorageRoot } from '../../config/storage-root';
 import { validateEnv } from '../../config/env.validation';
+import { redisConnectionOptions } from '../../config/redis-options';
 import {
   EXPECTED_MODE,
   EXPECTED_MODE_FLAG_PINNED,
@@ -68,11 +70,26 @@ const hostEnvSaved = HOST_ENV.map(k => [k, process.env[k]] as const);
 beforeAll(() => HOST_ENV.forEach(k => delete process.env[k]));
 afterAll(() => hostEnvSaved.forEach(([k, v]) => (process.env[k] = v)));
 
+// These helpers exercise individual settings on an otherwise complete PostgreSQL configuration.
+function completeDatabaseFixture(config: unknown, existing = ''): SaveConfigDto {
+  const payload = config as SaveConfigDto;
+  if (payload.database?.type !== 'postgres' || payload.database.builtIn === true) return payload;
+  const saved = jest.requireActual<typeof import('dotenv')>('dotenv').parse(existing);
+  return {
+    ...payload,
+    database: {
+      ...(!saved.DATABASE_HOST && !process.env.DATABASE_HOST ? { host: 'localhost' } : {}),
+      ...(!saved.DATABASE_USERNAME && !process.env.DATABASE_USERNAME ? { username: 'postgres' } : {}),
+      ...payload.database,
+    },
+  };
+}
+
 describe('InfraConfigController.saveConfig SSL reject-unauthorized', () => {
   function writtenEnv(config: unknown): string {
     const spy = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
     const controller = new InfraConfigController({} as never, {} as never, {} as never);
-    controller.saveConfig(config as never);
+    controller.saveConfig(completeDatabaseFixture(config));
     const content = spy.mock.calls[0][1] as string;
     spy.mockRestore();
     return content;
@@ -163,11 +180,123 @@ describe('InfraConfigController.saveConfig values the next boot refuses', () => 
     ['a negative pool size', { database: { ...external, poolSize: -5 } }],
     ['a fractional pool size', { database: { ...external, poolSize: 1.5 } }],
     ['a redis port that is not a number', { redis: { enabled: true, host: 'cache', port: 'x' } }],
+    [
+      'an S3 endpoint without a scheme',
+      {
+        storage: {
+          type: 's3',
+          builtIn: false,
+          s3Endpoint: 'minio:9000',
+          s3AccessKey: 'AccessKey1234',
+          s3SecretKey: 'SecretKey1234567',
+        },
+      },
+    ],
   ])('refuses %s instead of writing it', (_label, config) => {
     (fs.writeFileSync as jest.Mock).mockClear();
 
     expect(() => newController().saveConfig(config as never)).toThrow(BadRequestException);
     expect(fs.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  // An environment value outranks the file, so the boot validation of the save reads the pinned pool size and never
+  // sees the one being written, which the boot reads once the pin is lifted.
+  it('refuses a pool size that is not written as digits while the environment pins the pool size', () => {
+    process.env.DATABASE_POOL_SIZE = '20';
+    recordPinnedEnvKeys({ DATABASE_POOL_SIZE: '20' });
+    (fs.writeFileSync as jest.Mock).mockClear();
+    try {
+      expect(() => newController().saveConfig({ database: { ...external, poolSize: 1e21 } } as never)).toThrow(
+        BadRequestException,
+      );
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.DATABASE_POOL_SIZE;
+      recordPinnedEnvKeys({});
+    }
+  });
+
+  // The boot only reports an S3 endpoint the client cannot use, so an instance that stored one keeps starting, and the
+  // dashboard, which sends the storage type and endpoint with every save, must keep saving. The endpoint is refused
+  // only when the save changes what the boot reads for it or newly selects S3.
+  describe('an S3 endpoint without a scheme', () => {
+    const KEYS = 'S3_ACCESS_KEY_ID=AccessKey1234\nS3_SECRET_ACCESS_KEY=SecretKey1234567\n';
+    const S3_STORED = `STORAGE_TYPE=s3\nS3_ENDPOINT=minio:9000\n${KEYS}`;
+    const NEW_KEYS = { s3AccessKey: 'AccessKey1234', s3SecretKey: 'SecretKey1234567' };
+    const LOCAL_STORED = `STORAGE_TYPE=local\nS3_ENDPOINT=minio:9000\n${KEYS}`;
+    const store = (text: string) => {
+      (fs.existsSync as jest.Mock).mockReturnValue(true);
+      (fs.readFileSync as jest.Mock).mockReturnValue(text);
+      (fs.writeFileSync as jest.Mock).mockClear();
+    };
+    // What the dashboard sends after a reload: the storage section is always present, with the stored endpoint.
+    const dashboardSave = (storage: object) =>
+      ({
+        engine: { headless: false },
+        storage: { type: 's3', s3Bucket: 'media', s3Endpoint: 'minio:9000', ...storage },
+      }) as never;
+    afterEach(() => {
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+      (fs.readFileSync as jest.Mock).mockReturnValue('');
+      delete process.env.S3_ENDPOINT;
+      delete process.env.STORAGE_TYPE;
+      recordPinnedEnvKeys({});
+    });
+
+    it('does not stop a save of another section', () => {
+      store(S3_STORED);
+      expect(newController().saveConfig({ engine: { headless: false } }).saved).toBe(true);
+    });
+
+    it('does not stop a dashboard save that resubmits the stored endpoint', () => {
+      store(S3_STORED);
+      expect(newController().saveConfig(dashboardSave({})).saved).toBe(true);
+    });
+
+    it('refuses a save that changes it to another unusable value, with the boot text', () => {
+      store(S3_STORED);
+      expect(() => newController().saveConfig(dashboardSave({ s3Endpoint: 'other:9000' }))).toThrow(
+        /fails boot validation\. S3_ENDPOINT must be an absolute http\(s\) URL/,
+      );
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+    });
+
+    it('refuses a save that newly selects S3 beside it', () => {
+      store(LOCAL_STORED);
+      expect(() =>
+        newController().saveConfig({ storage: { type: 's3', s3Endpoint: 'minio:9000', ...NEW_KEYS } } as never),
+      ).toThrow(/S3_ENDPOINT must be an absolute http\(s\) URL/);
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+    });
+
+    it('refuses newly selecting S3 while the environment pins it', () => {
+      store(LOCAL_STORED);
+      process.env.S3_ENDPOINT = 'minio:9000';
+      recordPinnedEnvKeys({ S3_ENDPOINT: 'minio:9000' });
+      expect(() => newController().saveConfig({ storage: { type: 's3', ...NEW_KEYS } } as never)).toThrow(
+        /S3_ENDPOINT must be an absolute http\(s\) URL/,
+      );
+    });
+
+    it('saves a switch to local storage', () => {
+      store(S3_STORED);
+      expect(newController().saveConfig({ storage: { type: 'local', localPath: './data/media' } } as never).saved).toBe(
+        true,
+      );
+    });
+
+    it('accepts the endpoint once it carries the scheme', () => {
+      store(S3_STORED);
+      expect(newController().saveConfig(dashboardSave({ s3Endpoint: 'http://minio:9000' })).saved).toBe(true);
+    });
+
+    it('does not block a save while the environment pins it, which the page cannot change', () => {
+      store(S3_STORED);
+      Object.assign(process.env, { S3_ENDPOINT: 'minio:9000', STORAGE_TYPE: 's3' });
+      recordPinnedEnvKeys({ S3_ENDPOINT: 'minio:9000', STORAGE_TYPE: 's3' });
+      expect(newController().saveConfig(dashboardSave({})).saved).toBe(true);
+      expect(newController().saveConfig(dashboardSave({ s3Endpoint: 'http://minio:9000' })).saved).toBe(true);
+    });
   });
 
   it('writes a blank host and user as the defaults and trims a padded port', () => {
@@ -197,8 +326,8 @@ describe('InfraConfigController.saveConfig local storage path', () => {
   const newController = () => new InfraConfigController({} as never, {} as never, {} as never);
   const actual = jest.requireActual<typeof import('../../config/storage-root')>('../../config/storage-root');
   const useRealProbe = () => (resolveStorageRoot as jest.Mock).mockImplementationOnce(actual.resolveStorageRoot);
-  // A parent that is a file, so the directory cannot be created whoever runs the test.
-  const unwritable = '/dev/null/openwa-media';
+  // A parent that is a file inside ./data, so the directory passes containment and fails creation whoever runs the test.
+  const realFs = jest.requireActual<typeof import('fs')>('fs');
   const localAt = (localPath: string) => ({ storage: { type: 'local', localPath } }) as never;
 
   beforeEach(() => {
@@ -207,52 +336,82 @@ describe('InfraConfigController.saveConfig local storage path', () => {
   });
 
   it('refuses a path the app cannot create, and writes nothing', () => {
-    useRealProbe();
-
-    expect(() => newController().saveConfig(localAt(unwritable))).toThrow(BadRequestException);
-    expect(fs.writeFileSync).not.toHaveBeenCalled();
-  });
-
-  it('names the submitted path, not where it resolves to', () => {
-    // Relative, under a regular file (this one), so its absolute form carries the working directory.
-    const relative = path.relative(process.cwd(), path.join(__filename, 'media'));
-    useRealProbe();
-
-    let message = '';
-    try {
-      newController().saveConfig(localAt(relative));
-    } catch (error) {
-      message = (error as Error).message;
-    }
-
-    expect(message).toContain(`storage path '${relative}'`);
-    expect(message).not.toContain(process.cwd());
-  });
-
-  it('saves a path the app can write', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openwa-storage-'));
+    const origCwd = process.cwd();
+    const work = realFs.mkdtempSync(path.join(os.tmpdir(), 'openwa-storage-unwritable-'));
+    realFs.mkdirSync(path.join(work, 'data'));
+    realFs.writeFileSync(path.join(work, 'data', 'blocker'), '');
+    process.chdir(work);
     try {
       useRealProbe();
 
-      newController().saveConfig(localAt(path.join(root, 'media')));
+      expect(() => newController().saveConfig(localAt('./data/blocker/media'))).toThrow(BadRequestException);
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+    } finally {
+      process.chdir(origCwd);
+      realFs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('names the submitted path, not where it resolves to', () => {
+    const origCwd = process.cwd();
+    const work = realFs.mkdtempSync(path.join(os.tmpdir(), 'openwa-storage-name-'));
+    realFs.mkdirSync(path.join(work, 'data'));
+    realFs.writeFileSync(path.join(work, 'data', 'blocker'), '');
+    process.chdir(work);
+    try {
+      const relative = './data/blocker/media';
+      useRealProbe();
+
+      let message = '';
+      try {
+        newController().saveConfig(localAt(relative));
+      } catch (error) {
+        message = (error as Error).message;
+      }
+
+      expect(message).toContain(`storage path '${relative}'`);
+      expect(message).not.toContain(work);
+    } finally {
+      process.chdir(origCwd);
+      realFs.rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('saves a path the app can write', () => {
+    const origCwd = process.cwd();
+    const work = realFs.mkdtempSync(path.join(os.tmpdir(), 'openwa-storage-'));
+    realFs.mkdirSync(path.join(work, 'data'));
+    process.chdir(work);
+    try {
+      useRealProbe();
+
+      newController().saveConfig(localAt('./data/custom-media'));
 
       const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
-      expect(content).toContain(`STORAGE_LOCAL_PATH=${path.join(root, 'media')}`);
+      expect(content).toContain('STORAGE_LOCAL_PATH=./data/custom-media');
     } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      process.chdir(origCwd);
+      realFs.rmSync(work, { recursive: true, force: true });
     }
   });
 
   it('does not judge a path that a value pinned by the host outranks', () => {
     // With no boot snapshot recorded, every key in the environment counts as host-supplied.
+    const origCwd = process.cwd();
+    const work = realFs.mkdtempSync(path.join(os.tmpdir(), 'openwa-storage-pinned-'));
+    realFs.mkdirSync(path.join(work, 'data'));
+    realFs.writeFileSync(path.join(work, 'data', 'blocker'), '');
+    process.chdir(work);
     process.env.STORAGE_LOCAL_PATH = '/srv/openwa/media';
     try {
-      newController().saveConfig(localAt(unwritable));
+      newController().saveConfig(localAt('./data/blocker/media'));
 
       expect(resolveStorageRoot).not.toHaveBeenCalled();
       expect(fs.writeFileSync).toHaveBeenCalledTimes(1);
     } finally {
+      process.chdir(origCwd);
       delete process.env.STORAGE_LOCAL_PATH;
+      realFs.rmSync(work, { recursive: true, force: true });
     }
   });
 
@@ -271,7 +430,7 @@ describe('InfraConfigController PostgreSQL schema (POSTGRES_SCHEMA)', () => {
     (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
     (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
     (fs.writeFileSync as jest.Mock).mockClear();
-    newController().saveConfig(config as never);
+    newController().saveConfig(completeDatabaseFixture(config, existing));
     const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.readFileSync as jest.Mock).mockReturnValue('');
@@ -344,7 +503,9 @@ describe('InfraConfigController.saveConfig writes the generated env owner-only',
   it('persists data/.env.generated with mode 0600, not world-readable', () => {
     const writeSpy = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => undefined);
     const controller = new InfraConfigController({} as never, {} as never, {} as never);
-    controller.saveConfig({ database: { type: 'postgres', sslEnabled: true, password: 'pw' } } as never);
+    controller.saveConfig({
+      database: { type: 'postgres', host: 'db', username: 'app', sslEnabled: true, password: 'pw' },
+    } as never);
     const opts = writeSpy.mock.calls[0][2];
     expect(opts).toEqual({ mode: 0o600 });
     writeSpy.mockRestore();
@@ -358,7 +519,7 @@ describe('InfraConfigController.saveConfig env-name correctness and merge (#226)
     (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
     (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
     (fs.writeFileSync as jest.Mock).mockClear();
-    newController().saveConfig(config as never);
+    newController().saveConfig(completeDatabaseFixture(config, existing));
     const calls = (fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>;
     const content = calls[0][1];
     // Reset to defaults so later tests start from "no prior config".
@@ -369,13 +530,13 @@ describe('InfraConfigController.saveConfig env-name correctness and merge (#226)
 
   it('writes the env names the backend actually reads (not the old ignored names)', () => {
     const env = written({
-      engine: { headless: false, sessionDataPath: './sess', browserArgs: '--flag' },
+      engine: { headless: false, sessionDataPath: './data/sess', browserArgs: '--disable-extensions' },
       storage: { type: 's3', s3Bucket: 'b', s3AccessKey: 'ak', s3SecretKey: 'sk' },
     });
     // Correct names (configuration.ts reads these)
     expect(env).toContain('PUPPETEER_HEADLESS=false');
-    expect(env).toContain('SESSION_DATA_PATH=./sess');
-    expect(env).toContain('PUPPETEER_ARGS=--flag');
+    expect(env).toContain('SESSION_DATA_PATH=./data/sess');
+    expect(env).toContain('PUPPETEER_ARGS=--disable-extensions');
     expect(env).toContain('S3_ACCESS_KEY_ID=ak');
     expect(env).toContain('S3_SECRET_ACCESS_KEY=sk');
     // Old, silently-ignored names must be gone
@@ -474,7 +635,9 @@ describe('InfraConfigController.saveConfig writes values the next boot reads bac
   function savedPassword(password: string): { line: string | undefined; parsed: string | undefined } {
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.writeFileSync as jest.Mock).mockClear();
-    newController().saveConfig({ database: { type: 'postgres', builtIn: false, host: 'db', password } } as never);
+    newController().saveConfig({
+      database: { type: 'postgres', builtIn: false, host: 'db', username: 'app', password },
+    } as never);
     const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
     return {
       line: content.split('\n').find(l => l.startsWith('DATABASE_PASSWORD=')),
@@ -501,7 +664,7 @@ describe('InfraConfigController.saveConfig writes values the next boot reads bac
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.writeFileSync as jest.Mock).mockClear();
     newController().saveConfig({
-      database: { type: 'postgres', builtIn: false, host: 'db', password: databasePassword },
+      database: { type: 'postgres', builtIn: false, host: 'db', username: 'app', password: databasePassword },
       redis: { enabled: true, builtIn: false, host: 'cache', password: redisPassword },
     } as never);
     return ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
@@ -548,7 +711,7 @@ describe('InfraConfigController.saveConfig engine selection (persist ENGINE_TYPE
     (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
     (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
     (fs.writeFileSync as jest.Mock).mockClear();
-    newController().saveConfig(config as never);
+    newController().saveConfig(completeDatabaseFixture(config, existing));
     const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.readFileSync as jest.Mock).mockReturnValue('');
@@ -709,6 +872,7 @@ describe('InfraConfigController.saveConfig byte-identical regression (full dashb
         REDIS_ENABLED: 'true',
         REDIS_HOST: 'redis',
         REDIS_PORT: '6379',
+        REDIS_TLS: 'false',
         S3_ACCESS_KEY_ID: 'minioadmin',
         S3_BUCKET: 'openwa',
         S3_ENDPOINT: 'http://minio:9000',
@@ -749,7 +913,7 @@ describe('InfraConfigController.saveConfig byte-identical regression (full dashb
       'S3_REGION=eu-west-1',
       'ENGINE_TYPE=baileys',
       'PUPPETEER_HEADLESS=false',
-      'SESSION_DATA_PATH=/var/lib/openwa/sessions',
+      'SESSION_DATA_PATH=./data/custom-sessions',
       'PUPPETEER_ARGS=--no-sandbox',
       '',
     ].join('\n');
@@ -782,7 +946,7 @@ describe('InfraConfigController.saveConfig byte-identical regression (full dashb
       engine: {
         type: 'baileys',
         headless: false,
-        sessionDataPath: '/var/lib/openwa/sessions',
+        sessionDataPath: './data/custom-sessions',
         browserArgs: '--no-sandbox',
       },
     };
@@ -817,7 +981,7 @@ describe('InfraConfigController.saveConfig byte-identical regression (full dashb
         S3_ENDPOINT: 'https://s3.eu-west-1.amazonaws.com',
         S3_REGION: 'eu-west-1',
         S3_SECRET_ACCESS_KEY: 's3-super-secret',
-        SESSION_DATA_PATH: '/var/lib/openwa/sessions',
+        SESSION_DATA_PATH: './data/custom-sessions',
         STORAGE_TYPE: 's3',
       }),
     );
@@ -831,7 +995,7 @@ describe('InfraConfigController.saveConfig per-key merge (partial payloads)', ()
     (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
     (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
     (fs.writeFileSync as jest.Mock).mockClear();
-    newController().saveConfig(config as never);
+    newController().saveConfig(completeDatabaseFixture(config, existing));
     const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.readFileSync as jest.Mock).mockReturnValue('');
@@ -924,11 +1088,11 @@ describe('InfraConfigController.saveConfig per-key merge (partial payloads)', ()
   it('a partial engine save keeps the stored session path and browser args', () => {
     const env = written(
       { engine: { headless: false } },
-      'SESSION_DATA_PATH=./old-path\nPUPPETEER_ARGS=--custom-flag\n',
+      'SESSION_DATA_PATH=./old-path\nPUPPETEER_ARGS=--disable-extensions\n',
     );
     expect(env).toContain('PUPPETEER_HEADLESS=false');
     expect(env).toContain('SESSION_DATA_PATH=./old-path');
-    expect(env).toContain('PUPPETEER_ARGS=--custom-flag');
+    expect(env).toContain('PUPPETEER_ARGS=--disable-extensions');
   });
 
   // The page leaves out a type the environment pins while the operator has not touched it, so the pin is never
@@ -973,7 +1137,7 @@ describe('InfraConfigController.saveConfig per-key merge (partial payloads)', ()
     });
 
     it('keeps a stored PostgreSQL and S3 choice and their settings under the opposite pins', () => {
-      pin({ DATABASE_TYPE: 'sqlite', STORAGE_TYPE: 'local' });
+      pin({ DATABASE_TYPE: 'sqlite', DATABASE_NAME: './data/pinned.sqlite', STORAGE_TYPE: 'local' });
 
       const env = written(
         {
@@ -995,6 +1159,8 @@ describe('InfraConfigController.saveConfig per-key merge (partial payloads)', ()
     it('keeps a stored SQLite and local choice under the opposite pins, with no bundled container', () => {
       pin({
         DATABASE_TYPE: 'postgres',
+        DATABASE_HOST: 'db.pinned.example',
+        DATABASE_USERNAME: 'app',
         DATABASE_PASSWORD: 'Str0ng!Passw0rd',
         STORAGE_TYPE: 's3',
         S3_ACCESS_KEY_ID: 'ak-strong',
@@ -1017,6 +1183,8 @@ describe('InfraConfigController.saveConfig per-key merge (partial payloads)', ()
     it('follows a pinned type without writing it when nothing is stored', () => {
       pin({
         DATABASE_TYPE: 'postgres',
+        DATABASE_HOST: 'db.pinned.example',
+        DATABASE_USERNAME: 'app',
         DATABASE_PASSWORD: 'Str0ng!Passw0rd',
         STORAGE_TYPE: 's3',
         S3_ACCESS_KEY_ID: 'ak-strong',
@@ -1185,7 +1353,6 @@ describe('InfraConfigController.saveConfig per-key merge (partial payloads)', ()
           S3_ACCESS_KEY_ID: 'StoredKey123456',
           S3_SECRET_ACCESS_KEY: 'StoredSecret1234567890',
         };
-        delete expectedExplicit.REDIS_PASSWORD;
         expect(explicit).toEqual(expectedExplicit);
         expect(dotenv.parse(written({ database: { poolSize: 25 }, redis: {}, storage: {} }, stored))).toEqual({
           ...dotenv.parse(stored),
@@ -1291,7 +1458,7 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
     (fs.existsSync as jest.Mock).mockReturnValue(existing !== undefined);
     (fs.readFileSync as jest.Mock).mockReturnValue(existing ?? '');
     (fs.writeFileSync as jest.Mock).mockClear();
-    newController().saveConfig(config as never);
+    newController().saveConfig(completeDatabaseFixture(config, existing));
     const content = ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>)[0][1];
     (fs.existsSync as jest.Mock).mockReturnValue(false);
     (fs.readFileSync as jest.Mock).mockReturnValue('');
@@ -1895,15 +2062,26 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
       ];
       const switchBack = (running: Record<string, string>) => {
         Object.assign(process.env, running);
-        const env = jest
-          .requireActual<typeof import('dotenv')>('dotenv')
-          .parse(
-            written(
-              { database: { type: 'postgres', builtIn: true }, storage: { type: 's3', builtIn: true } },
-              SWITCHED,
-            ),
-          );
-        return Object.fromEntries(KEYS.map(key => [key, env[key]]));
+        // These runtime values came from the generated file, so they are not host overrides of the new save.
+        const precedence =
+          jest.requireActual<typeof import('../../config/env-precedence')>('../../config/env-precedence');
+        const wasOsProvided = precedence.isOsProvidedEnv;
+        const source = jest
+          .spyOn(precedence, 'isOsProvidedEnv')
+          .mockImplementation(key => !Object.prototype.hasOwnProperty.call(running, key) && wasOsProvided(key));
+        try {
+          const env = jest
+            .requireActual<typeof import('dotenv')>('dotenv')
+            .parse(
+              written(
+                { database: { type: 'postgres', builtIn: true }, storage: { type: 's3', builtIn: true } },
+                SWITCHED,
+              ),
+            );
+          return Object.fromEntries(KEYS.map(key => [key, env[key]]));
+        } finally {
+          source.mockRestore();
+        }
       };
       // Nothing is pinned: the running process holds the values its boot loaded from the file.
       afterEach(() => {
@@ -1956,7 +2134,12 @@ describe('InfraConfigController.saveConfig built-in/external mode flips and the 
       });
 
       it('writes the bundled ones while the running process uses SQLite and local storage', () => {
-        const env = switchBack({ ...RUNNING, DATABASE_TYPE: 'sqlite', STORAGE_TYPE: 'local' });
+        const env = switchBack({
+          ...RUNNING,
+          DATABASE_TYPE: 'sqlite',
+          DATABASE_NAME: './data/running.sqlite',
+          STORAGE_TYPE: 'local',
+        });
         expect([env.DATABASE_NAME, env.DATABASE_PASSWORD, env.S3_BUCKET, env.S3_ACCESS_KEY_ID]).toEqual([
           'openwa',
           'openwa',
@@ -2176,6 +2359,7 @@ describe('InfraConfigController.saveConfig persists strictly-coerced form boolea
         type: 'postgres',
         builtIn: 'false',
         host: 'db.example.com',
+        username: 'app',
         password: 'unit-test-pw',
         sslEnabled: 'true',
         sslRejectUnauthorized: 'false',
@@ -2535,7 +2719,7 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
     new InfraConfigController(
       {} as never, // engineFactory
       dockerService as never,
-      { shutdown: jest.fn() } as never, // shutdownService
+      { shutdown: jest.fn(), isShuttingDown: () => false } as never, // shutdownService
     );
 
   it('tears down only allowlisted profiles, never an unknown or empty entry', async () => {
@@ -2576,6 +2760,22 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
     expect(JSON.stringify(result.removal)).not.toContain('removed');
   });
 
+  it('does not list a profile as stopped when Docker could not list its container', async () => {
+    const docker = {
+      listContainers: jest.fn().mockRejectedValue(new Error('socket hang up')),
+      getContainer: jest.fn(),
+    };
+    const dockerService = new DockerService();
+    Object.assign(dockerService as unknown as Record<string, unknown>, { docker, isAvailable: true });
+    const controller = buildController(dockerService as unknown as Record<string, unknown>);
+
+    const result = await controller.requestRestart({ profilesToRemove: ['minio'] });
+
+    // Nothing is known about the container, so the answer must not say it was stopped: the dashboard warns from errors.
+    expect(result.removal).toEqual({ stopped: [], errors: ['Failed to stop minio'] });
+    expect(docker.getContainer).not.toHaveBeenCalled();
+  });
+
   // A name every object inherits is no profile either: it is ignored like any other unknown name, and the managed
   // names beside it still act.
   describe('POST /api/infra/restart with a profile name an object inherits', () => {
@@ -2592,7 +2792,7 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
             provide: DockerService,
             useValue: { isDockerAvailable: () => true, stopManagedService, orchestrateProfiles },
           },
-          { provide: ShutdownService, useValue: { shutdown: jest.fn() } },
+          { provide: ShutdownService, useValue: { shutdown: jest.fn(), isShuttingDown: () => false } },
         ],
       }).compile();
       app = moduleRef.createNestApplication({ logger: false });
@@ -2617,7 +2817,7 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
   });
 
   describe('a service the environment pins the app to', () => {
-    const KEYS = ['DATABASE_HOST', 'REDIS_HOST', 'S3_ENDPOINT'];
+    const KEYS = ['DATABASE_HOST', 'REDIS_HOST', 'S3_ENDPOINT', 'DATABASE_TYPE', 'REDIS_ENABLED', 'STORAGE_TYPE'];
     let savedEnv: Array<[string, string | undefined]>;
 
     beforeEach(() => {
@@ -2637,6 +2837,9 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
       process.env.DATABASE_HOST = 'postgres';
       process.env.REDIS_HOST = 'redis';
       process.env.S3_ENDPOINT = 'http://minio:9000';
+      process.env.DATABASE_TYPE = 'postgres';
+      process.env.REDIS_ENABLED = 'true';
+      process.env.STORAGE_TYPE = 's3';
       recordPinnedEnvKeys(process.env);
       const stopManagedService = jest.fn().mockResolvedValue(true);
       const controller = buildController({
@@ -2771,7 +2974,7 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
     ] as const)('%s switched off from the page', (service, payload) => {
       it('is stopped by the restart that follows the save', async () => {
         const saved = [
-          'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=true\nDATABASE_HOST=postgres\nDATABASE_PASSWORD=openwa',
+          'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=true\nDATABASE_HOST=postgres\nDATABASE_USERNAME=openwa\nDATABASE_PASSWORD=openwa',
           'REDIS_ENABLED=true\nREDIS_BUILTIN=true\nREDIS_HOST=redis\nREDIS_PORT=6379\nQUEUE_ENABLED=true',
           'STORAGE_TYPE=s3\nMINIO_BUILTIN=true\nS3_ENDPOINT=http://minio:9000\nS3_ACCESS_KEY_ID=minioadmin',
           'S3_SECRET_ACCESS_KEY=minioadmin\n',
@@ -2906,6 +3109,247 @@ describe('InfraConfigController.requestRestart constrains teardown to managed pr
   });
 });
 
+// The next boot dials the database the saved file names. Restarting into a built-in PostgreSQL that did not start
+// fails that boot and every one after it, with the dashboard that could undo the save down.
+describe('InfraConfigController.requestRestart when the built-in database does not start', () => {
+  const RUNNING = 'DATABASE_TYPE=sqlite\nENGINE_TYPE=baileys\n';
+  const SAVED_BUILT_IN =
+    'DATABASE_TYPE=postgres\nPOSTGRES_BUILTIN=true\nDATABASE_HOST=postgres\nDATABASE_USERNAME=openwa\n' +
+    'DATABASE_PASSWORD=openwa\nDATABASE_NAME=openwa\n';
+  const startError = "Failed to create or start the 'postgres' container; see the server log for the Docker error.";
+  const failedStart = {
+    success: false,
+    message: startError,
+    containersStarted: [],
+    containersStopped: [],
+    errors: [startError],
+    estimatedTime: 35,
+  };
+  const parsed = (text: string) => jest.requireActual<typeof import('dotenv')>('dotenv').parse(text);
+  const writes = (): string[] => ((fs.writeFileSync as jest.Mock).mock.calls as Array<[string, string]>).map(c => c[1]);
+  let shutdown: jest.Mock;
+  let isShuttingDown: jest.Mock;
+  let stopManagedService: jest.Mock;
+  let orchestrateProfiles: jest.Mock;
+
+  const build = (orchestration: object, audit?: { logInfo: jest.Mock; logWarn: jest.Mock }): InfraConfigController => {
+    shutdown = jest.fn();
+    isShuttingDown = jest.fn().mockReturnValue(false);
+    stopManagedService = jest.fn().mockResolvedValue(true);
+    orchestrateProfiles = jest.fn().mockResolvedValue(orchestration);
+    const dockerService = { isDockerAvailable: () => true, stopManagedService, orchestrateProfiles };
+    return new InfraConfigController(
+      {} as never,
+      dockerService as never,
+      { shutdown, isShuttingDown } as never,
+      audit as never,
+    );
+  };
+  // The page's own save of the built-in database over the file this process booted from.
+  const saveBuiltIn = (controller: InfraConfigController): string[] => {
+    const { saved, profiles } = controller.saveConfig({ database: { type: 'postgres', builtIn: true } });
+    expect(saved).toBe(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue(writes().at(-1));
+    return profiles;
+  };
+  const refusalOf = async (promise: Promise<unknown>): Promise<ConflictException> => {
+    const error = await promise.then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(ConflictException);
+    return error as ConflictException;
+  };
+
+  beforeEach(() => {
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue(RUNNING);
+    (fs.writeFileSync as jest.Mock).mockClear();
+    recordPinnedEnvKeys({});
+  });
+  afterEach(() => {
+    delete process.env.DATABASE_TYPE;
+    delete process.env.DATABASE_HOST;
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+  });
+
+  it('answers 409, stops nothing, and puts back the configuration this server runs', async () => {
+    const controller = build(failedStart);
+    const profiles = saveBuiltIn(controller);
+    expect(profiles).toContain('postgres');
+
+    const refusal = await refusalOf(controller.requestRestart({ profiles, profilesToRemove: ['redis'] }));
+
+    expect(refusal.getResponse()).toMatchObject({ statusCode: 409, code: 'RESTART_DATABASE_NOT_STARTED' });
+    expect(refusal.message).toContain('put back');
+    expect(refusal.message).toContain(startError);
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(stopManagedService).not.toHaveBeenCalled();
+    expect(parsed(writes().at(-1)!)).toEqual(parsed(RUNNING));
+  });
+
+  it('says the saved configuration still selects it when this process saved nothing to put back', async () => {
+    (fs.readFileSync as jest.Mock).mockReturnValue(SAVED_BUILT_IN);
+    const controller = build({ ...failedStart, errors: [], message: 'Docker is not available' });
+
+    const refusal = await refusalOf(controller.requestRestart({ profiles: ['postgres'] }));
+
+    expect(refusal.message).toContain('still selects it');
+    expect(refusal.message).toContain('Docker is not available');
+    expect(shutdown).not.toHaveBeenCalled();
+    expect(writes()).toEqual([]);
+  });
+
+  it('says the saved configuration still selects it when putting it back fails', async () => {
+    const controller = build(failedStart);
+    const profiles = saveBuiltIn(controller);
+    (fs.writeFileSync as jest.Mock).mockImplementationOnce(() => {
+      throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+    });
+
+    const refusal = await refusalOf(controller.requestRestart({ profiles }));
+
+    expect(refusal.message).toContain('still selects it');
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it('restarts when the built-in database started, whatever else failed', async () => {
+    const controller = build({
+      ...failedStart,
+      success: true,
+      containersStarted: ['postgres'],
+      errors: ["Failed to create or start the 'redis' container; see the server log for the Docker error."],
+    });
+    const profiles = saveBuiltIn(controller);
+
+    const result = await controller.requestRestart({ profiles: [...profiles, 'redis'] });
+
+    expect(result.restarting).toBe(true);
+    expect(shutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it('restarts as before when this server already runs on the built-in database', async () => {
+    process.env.DATABASE_TYPE = 'postgres';
+    process.env.DATABASE_HOST = 'postgres';
+    (fs.readFileSync as jest.Mock).mockReturnValue(SAVED_BUILT_IN);
+    const controller = build(failedStart);
+
+    await controller.requestRestart({ profiles: ['postgres'] });
+
+    expect(shutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it('puts back the overlay this process booted from after more than one save', async () => {
+    const controller = build(failedStart);
+    expect(controller.saveConfig({ engine: { headless: false } }).saved).toBe(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue(writes().at(-1));
+    const profiles = saveBuiltIn(controller);
+
+    await refusalOf(controller.requestRestart({ profiles }));
+
+    expect(parsed(writes().at(-1)!)).toEqual(parsed(RUNNING));
+  });
+
+  it('refuses a second restart while the first is still running, and accepts one after it', async () => {
+    const controller = build(failedStart);
+    let finish!: (orchestration: object) => void;
+    orchestrateProfiles.mockImplementationOnce(() => new Promise<object>(resolve => (finish = resolve)));
+    const first = controller.requestRestart({ profiles: ['redis'] });
+
+    const refusal = await refusalOf(controller.requestRestart({ profiles: ['redis'] }));
+    expect(refusal.getResponse()).toMatchObject({ statusCode: 409, code: 'RESTART_ALREADY_RUNNING' });
+    expect(orchestrateProfiles).toHaveBeenCalledTimes(1);
+
+    finish({ ...failedStart, success: true, containersStarted: ['redis'], errors: [] });
+    await expect(first).resolves.toMatchObject({ restarting: true });
+    await expect(controller.requestRestart({ profiles: ['redis'] })).resolves.toMatchObject({ restarting: true });
+  });
+
+  it('refuses a restart requested while the server is already shutting down for one', async () => {
+    const controller = build({ ...failedStart, success: true, containersStarted: ['redis'], errors: [] });
+    isShuttingDown.mockReturnValue(true);
+
+    const refusal = await refusalOf(controller.requestRestart({ profiles: ['redis'] }));
+
+    expect(refusal.getResponse()).toMatchObject({ statusCode: 409, code: 'RESTART_ALREADY_RUNNING' });
+    expect(orchestrateProfiles).not.toHaveBeenCalled();
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it('frees the restart for the next request after a refusal', async () => {
+    const controller = build(failedStart);
+    const profiles = saveBuiltIn(controller);
+
+    await refusalOf(controller.requestRestart({ profiles }));
+    const again = await refusalOf(controller.requestRestart({ profiles }));
+
+    expect(again.getResponse()).toMatchObject({ code: 'RESTART_DATABASE_NOT_STARTED' });
+  });
+
+  it('puts nothing back when the server begins shutting down for another restart during the start', async () => {
+    const controller = build(failedStart);
+    const profiles = saveBuiltIn(controller);
+    const writesBefore = writes().length;
+    orchestrateProfiles.mockImplementationOnce(() => {
+      isShuttingDown.mockReturnValue(true);
+      return Promise.resolve(failedStart);
+    });
+
+    const refusal = await refusalOf(controller.requestRestart({ profiles }));
+
+    expect(refusal.getResponse()).toMatchObject({ code: 'RESTART_ALREADY_RUNNING' });
+    expect(writes()).toHaveLength(writesBefore);
+    expect(shutdown).not.toHaveBeenCalled();
+  });
+
+  it('records a refused restart in the audit log with whether the configuration was put back', async () => {
+    const audit = { logInfo: jest.fn().mockResolvedValue(null), logWarn: jest.fn().mockResolvedValue(null) };
+    const controller = build(failedStart, audit);
+    const profiles = saveBuiltIn(controller);
+
+    await refusalOf(controller.requestRestart({ profiles, profilesToRemove: ['redis'] }));
+
+    expect(audit.logWarn).toHaveBeenCalledWith(AuditAction.INFRA_RESTART_REQUESTED, {
+      metadata: {
+        profiles,
+        profilesToRemove: ['redis'],
+        refused: 'RESTART_DATABASE_NOT_STARTED',
+        configRestored: true,
+      },
+    });
+    expect(audit.logInfo).not.toHaveBeenCalledWith(AuditAction.INFRA_RESTART_REQUESTED, expect.anything());
+  });
+
+  it('answers the refusal on the wire as a 409 with its code', async () => {
+    (fs.readFileSync as jest.Mock).mockReturnValue(SAVED_BUILT_IN);
+    const moduleRef = await Test.createTestingModule({
+      controllers: [InfraConfigController],
+      providers: [
+        { provide: EngineFactory, useValue: {} },
+        {
+          provide: DockerService,
+          useValue: { isDockerAvailable: () => true, orchestrateProfiles: jest.fn().mockResolvedValue(failedStart) },
+        },
+        { provide: ShutdownService, useValue: { shutdown: jest.fn(), isShuttingDown: () => false } },
+      ],
+    }).compile();
+    const app = moduleRef.createNestApplication({ logger: false });
+    applyGlobalValidation(app);
+    await app.init();
+    try {
+      const res = await request(app.getHttpServer() as Server)
+        .post('/api/infra/restart')
+        .send({ profiles: ['postgres'] });
+
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ code: 'RESTART_DATABASE_NOT_STARTED' });
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 // The infra module's sensitive ADMIN operations (credential config write, restart/Docker
 // orchestration, full-DB + storage export/import) must leave an audit trail — each emits an AuditAction.
 describe('InfraConfigController audit trail (light-dependency handlers)', () => {
@@ -2930,7 +3374,9 @@ describe('InfraConfigController audit trail (light-dependency handlers)', () => 
 
   it('saveConfig emits INFRA_CONFIG_SAVED without leaking secret values into the metadata', () => {
     const audit = makeAudit();
-    build(audit).saveConfig({ database: { type: 'postgres', host: 'db', password: 'topsecret' } } as never);
+    build(audit).saveConfig({
+      database: { type: 'postgres', host: 'db', username: 'app', password: 'topsecret' },
+    } as never);
     expect(audit.logInfo).toHaveBeenCalledTimes(1);
     const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { sections: string[] } }]>;
     const [action, ctx] = calls[0];
@@ -2951,11 +3397,282 @@ describe('InfraConfigController audit trail (light-dependency handlers)', () => 
     const audit = makeAudit();
     const controller = build(audit, {
       dockerService: { isDockerAvailable: () => false },
-      shutdownService: { shutdown: jest.fn() },
+      shutdownService: { shutdown: jest.fn(), isShuttingDown: () => false },
     });
     await controller.requestRestart({ profiles: ['postgres'], profilesToRemove: [] });
     const calls = audit.logInfo.mock.calls as Array<[AuditAction, { metadata: { profiles: string[] } }]>;
     expect(calls[0][0]).toBe(AuditAction.INFRA_RESTART_REQUESTED);
     expect(calls[0][1].metadata.profiles).toEqual(['postgres']);
+  });
+});
+
+describe('InfraConfigController built-in Redis transport', () => {
+  const external =
+    'DATABASE_TYPE=sqlite\nSTORAGE_TYPE=local\nREDIS_ENABLED=true\nREDIS_BUILTIN=false\n' +
+    'REDIS_HOST=cache.external.invalid\nREDIS_PORT=6379\nREDIS_TLS=true\n';
+  const keys = ['REDIS_TLS', 'REDIS_HOST', 'REDIS_ENABLED', 'REDIS_BUILTIN', 'QUEUE_ENABLED', 'CACHE_ENABLED'];
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    for (const key of keys) delete process.env[key];
+    recordOsEnvKeys({});
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue(external);
+    (fs.writeFileSync as jest.Mock).mockClear();
+  });
+  afterEach(() => {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    recordOsEnvKeys({});
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+  });
+
+  function write(redis: NonNullable<SaveConfigDto['redis']>): Record<string, string> {
+    const controller = new InfraConfigController({} as never, {} as never, {} as never);
+    expect(controller.saveConfig({ redis }).saved).toBe(true);
+    const content = jest.mocked(fs.writeFileSync).mock.calls.at(-1)![1] as string;
+    return jest.requireActual<typeof import('dotenv')>('dotenv').parse(content);
+  }
+
+  it('resets saved TLS when switching to the plaintext built-in Redis', () => {
+    const env = write({ enabled: true, builtIn: true });
+    expect(env.REDIS_HOST).toBe('redis');
+    expect(env.REDIS_BUILTIN).toBe('true');
+    Object.assign(process.env, { REDIS_HOST: env.REDIS_HOST, REDIS_TLS: env.REDIS_TLS ?? '' });
+    expect(redisConnectionOptions().tls).toBeUndefined();
+  });
+
+  it('keeps TLS for an external Redis configuration', () => {
+    const env = write({ enabled: true, builtIn: false, host: 'cache.external.invalid' });
+    Object.assign(process.env, { REDIS_HOST: env.REDIS_HOST, REDIS_TLS: env.REDIS_TLS });
+    expect(redisConnectionOptions()).toMatchObject({ host: 'cache.external.invalid', tls: {} });
+  });
+
+  it('keeps TLS when an external host pin overrides a saved built-in choice', () => {
+    process.env.REDIS_HOST = 'cache.external.invalid';
+    process.env.REDIS_TLS = 'true';
+    recordPinnedEnvKeys({ REDIS_HOST: 'cache.external.invalid', REDIS_TLS: 'true' });
+    const env = write({ enabled: true, builtIn: true });
+    expect(env.REDIS_TLS).toBe('true');
+    expect(redisConnectionOptions()).toMatchObject({ host: 'cache.external.invalid', tls: {} });
+  });
+});
+
+describe('InfraConfigController built-in Redis username', () => {
+  const keys = [
+    'REDIS_USERNAME',
+    'REDIS_PASSWORD',
+    'REDIS_HOST',
+    'REDIS_PORT',
+    'REDIS_TLS',
+    'REDIS_ENABLED',
+    'REDIS_BUILTIN',
+    'QUEUE_ENABLED',
+    'CACHE_ENABLED',
+  ];
+  let previous: Record<string, string | undefined>;
+  const stored = (values: Record<string, string> = {}) =>
+    Object.entries({
+      DATABASE_TYPE: 'sqlite',
+      STORAGE_TYPE: 'local',
+      REDIS_ENABLED: 'true',
+      REDIS_BUILTIN: 'false',
+      REDIS_HOST: 'cache.external.invalid',
+      REDIS_PORT: '6381',
+      REDIS_USERNAME: 'worker',
+      REDIS_PASSWORD: 'DummyRedisPassword123456',
+      REDIS_TLS: 'false',
+      QUEUE_ENABLED: 'false',
+      CACHE_ENABLED: 'false',
+      ...values,
+    })
+      .map(([key, value]) => `${key}=${value}`)
+      .join('\n') + '\n';
+
+  beforeEach(() => {
+    previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    for (const key of keys) delete process.env[key];
+    recordOsEnvKeys({});
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(true);
+    (fs.readFileSync as jest.Mock).mockReturnValue(stored());
+    (fs.writeFileSync as jest.Mock).mockClear();
+  });
+  afterEach(() => {
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+    recordOsEnvKeys({});
+    recordPinnedEnvKeys({});
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+  });
+
+  function write(redis: NonNullable<SaveConfigDto['redis']>): Record<string, string> {
+    const controller = new InfraConfigController({} as never, {} as never, {} as never);
+    expect(controller.saveConfig({ redis }).saved).toBe(true);
+    return jest
+      .requireActual<typeof import('dotenv')>('dotenv')
+      .parse(jest.mocked(fs.writeFileSync).mock.calls.at(-1)![1] as string);
+  }
+
+  it('clears an old generated username when selecting the bundled Redis', () => {
+    expect(write({ enabled: true, builtIn: true }).REDIS_USERNAME).toBeUndefined();
+  });
+
+  it.each(['host', 'project file'])('allows the default username from the %s', origin => {
+    process.env.REDIS_USERNAME = 'default';
+    recordOsEnvKeys(origin === 'host' ? { REDIS_USERNAME: 'default' } : {});
+    recordPinnedEnvKeys({ REDIS_USERNAME: 'default' });
+    expect(write({ enabled: true, builtIn: true }).REDIS_USERNAME).toBeUndefined();
+  });
+
+  it('keeps an external pinned username and the deliberate preset port/password behavior', () => {
+    process.env.REDIS_HOST = 'cache.external.invalid';
+    recordPinnedEnvKeys({ REDIS_HOST: process.env.REDIS_HOST });
+    const saved = write({ enabled: true, builtIn: true });
+    expect(saved.REDIS_USERNAME).toBe('worker');
+    expect(saved.REDIS_PORT).toBe('6379');
+    expect(saved.REDIS_PASSWORD).toBeUndefined();
+  });
+
+  it('accepts a named user for explicit external mode at the bundled host spelling', () => {
+    expect(write({ enabled: true, builtIn: false, host: 'redis' }).REDIS_USERNAME).toBe('worker');
+  });
+
+  it('permits an inactive named username pin', () => {
+    process.env.REDIS_USERNAME = 'worker';
+    recordPinnedEnvKeys({ REDIS_USERNAME: 'worker' });
+    (fs.readFileSync as jest.Mock).mockReturnValue(stored({ REDIS_ENABLED: 'false' }));
+    expect(() => write({ enabled: false, builtIn: true })).not.toThrow();
+  });
+
+  it('preserves an already-configured built-in REDIS_PASSWORD when saving built-in Redis with a blank password', () => {
+    (fs.readFileSync as jest.Mock).mockReturnValue(
+      stored({
+        REDIS_BUILTIN: 'true',
+        REDIS_HOST: 'redis',
+        REDIS_PORT: '6379',
+        REDIS_USERNAME: '',
+        REDIS_PASSWORD: 'BuiltinRedisSecret987',
+      }),
+    );
+    const saved = write({ enabled: true, builtIn: true });
+    expect(saved.REDIS_PASSWORD).toBe('BuiltinRedisSecret987');
+    expect(saved.REDIS_HOST).toBe('redis');
+  });
+});
+
+describe('InfraConfigController.saveConfig PUPPETEER_ARGS allowlist and data-dir path containment', () => {
+  const newController = () => new InfraConfigController({} as never, {} as never, {} as never);
+
+  beforeEach(() => {
+    (fs.writeFileSync as jest.Mock).mockClear();
+    (fs.existsSync as jest.Mock).mockReturnValue(false);
+    (fs.readFileSync as jest.Mock).mockReturnValue('');
+    (resolveStorageRoot as jest.Mock).mockClear();
+  });
+
+  it.each([
+    '--gpu-launcher=/bin/sh',
+    '--utility-cmd-prefix=sh',
+    '--renderer-cmd-prefix=sh',
+    '--browser-subprocess-path=/bin/sh',
+    '--load-extension=/tmp/ext',
+    '--disable-extensions-except=/tmp/ext',
+    '--remote-debugging-port=9222',
+    '--user-data-dir=/tmp/profile',
+    '--disk-cache-dir=/tmp/cache',
+    '--proxy-server=http://evil:8080',
+    '--proxy-pac-url=http://evil/pac',
+    '--disable-web-security',
+    '--ignore-certificate-errors',
+    '--js-flags=--expose-gc',
+    '--no-sandbox https://evil.example',
+  ])('rejects disallowed browserArgs %j with BadRequestException before writing', malicious => {
+    expect(() => newController().saveConfig({ engine: { browserArgs: malicious } })).toThrow(BadRequestException);
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it.each(['   ', ',,,', ' , , '])(
+    'persists DEFAULT_PUPPETEER_ARGS when browserArgs=%j contains no flags',
+    blankOrCommas => {
+      newController().saveConfig({ engine: { browserArgs: blankOrCommas } });
+      const written = jest.mocked(fs.writeFileSync).mock.calls.at(-1)![1] as string;
+      const parsed = jest.requireActual<typeof import('dotenv')>('dotenv').parse(written);
+      expect(parsed.PUPPETEER_ARGS).toBe('--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu');
+    },
+  );
+
+  it.each([
+    './data',
+    './data/.',
+    './data/ ',
+    './data/.. ',
+    './data/../outside',
+    './data/sub/../other',
+    '../outside',
+    '/etc/passwd',
+    './data/media\0evil',
+  ])('rejects storage.localPath=%j outside ./data before calling resolveStorageRoot', badPath => {
+    expect(() => newController().saveConfig({ storage: { type: 'local', localPath: badPath } } as never)).toThrow(
+      BadRequestException,
+    );
+    expect(resolveStorageRoot).not.toHaveBeenCalled();
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    './data',
+    './data/.',
+    './data/ ',
+    './data/.. ',
+    './data/../outside',
+    './data/sub/../other',
+    '../outside',
+    '/var/lib/openwa/sessions',
+    './data/sess\0x',
+  ])('rejects engine.sessionDataPath=%j outside ./data before writing', badPath => {
+    expect(() => newController().saveConfig({ engine: { sessionDataPath: badPath } })).toThrow(BadRequestException);
+    expect(fs.writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it('rejects symlink escapes and ..-over-symlink paths out of ./data for both storage.localPath and engine.sessionDataPath', () => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-path-contain-'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-path-outside-'));
+    fs.mkdirSync(path.join(work, 'data'));
+    fs.symlinkSync(outside, path.join(work, 'data', 'escape'));
+    fs.symlinkSync(path.join(outside, 'nonexistent'), path.join(work, 'data', 'dangling'));
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue(work);
+    try {
+      for (const candidate of [
+        './data/escape',
+        './data/escape/sub',
+        './data/escape/../pwn',
+        './data/escape/..',
+        './data/dangling',
+        './data/dangling/sub',
+      ]) {
+        expect(() => newController().saveConfig({ storage: { type: 'local', localPath: candidate } } as never)).toThrow(
+          BadRequestException,
+        );
+        expect(() => newController().saveConfig({ engine: { sessionDataPath: candidate } })).toThrow(
+          BadRequestException,
+        );
+      }
+      expect(resolveStorageRoot).not.toHaveBeenCalled();
+      expect(fs.writeFileSync).not.toHaveBeenCalled();
+    } finally {
+      cwdSpy.mockRestore();
+      fs.rmSync(work, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

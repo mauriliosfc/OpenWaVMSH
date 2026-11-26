@@ -18,6 +18,7 @@ import {
   PollInput,
   ContactCard,
   MessageReaction,
+  MessageReceipts,
   Label,
   Channel,
   ChannelMessage,
@@ -39,7 +40,9 @@ import { isChannelJid } from '../identity/wa-id';
 import { LidMappingStore } from '../identity/lid-mapping-store.service';
 import { createLogger } from '../../common/services/logger.service';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { EnginePageReloadingError } from '../../common/errors/engine-page-reloading.error';
 import { ChannelMediaNotSupportedError } from '../../common/errors/channel-media-not-supported.error';
+import { markNothingSent } from '../../common/errors/engine-not-sent.error';
 import { WwebjsGroups } from './wwebjs-groups';
 import { type WwebjsEngineHost } from './wwebjs-host';
 import { registerWwebjsMessageEvents } from './wwebjs-message-events';
@@ -186,6 +189,7 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
       isPageTransportError: error => this.isPageTransportError(error),
       reportIfPageTransportError: (error, context) => this.reportIfPageTransportError(error, context),
       reportOnceGone: (error, context) => this.lifecycle.reportOnceGone(error, context),
+      navigationCount: () => this.lifecycle.stampedNavigations(),
       ensureNotChannelRecipient: chatId => this.ensureNotChannelRecipient(chatId),
       // The raw answer, `@lid` included: the send resolver addresses a migrated contact by it, while the
       // public getNumberId reports the neutral phone id.
@@ -214,6 +218,8 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
       setStatus: status => this.lifecycle.setStatus(status),
       getCallbacks: () => this.callbacks,
       markReadyFromClientInfo: () => this.lifecycle.markReadyFromClientInfo(),
+      stampedNavigations: () => this.lifecycle.stampedNavigations(),
+      closeRecoveredEpisode: navigationsBefore => this.lifecycle.closeRecoveredEpisode(navigationsBefore),
       wasFreshPairing: () => this.lifecycle.qrShown,
       recoverFromStuckAuth: () => this.recoverFromStuckAuth(),
     });
@@ -223,6 +229,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
       getClient: () => this.client,
       setClient: client => (this.lifecycle.client = client),
       setStatus: status => this.lifecycle.setStatus(status),
+      isTearingDown: () => this.tearingDown,
+      isDisconnectReported: () => this.disconnectReported,
+      markCredentialTeardownStarted: () => this.lifecycle.markCredentialTeardownStarted(),
+      clearTimersAndTransientState: () => this.lifecycle.clearTimersAndTransientState(),
       getCallbacks: () => this.callbacks,
     });
     this.calls = new WwebjsCalls({
@@ -508,7 +518,7 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
   }
 
   /**
-   * whatsapp-web.js 1.34.7 can read labels and assign them, but cannot create, rename, recolour or
+   * whatsapp-web.js 1.34.8 can read labels and assign them, but cannot create, rename, recolour or
    * delete one — `index.d.ts` exposes getLabels / getLabelById / getChatLabels / getChatsByLabelId /
    * addOrRemoveLabels and nothing that edits the label itself.
    */
@@ -585,6 +595,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
 
   resolveContactPhone(contactId: string): Promise<string | null> {
     return this.contacts.resolveContactPhone(contactId);
+  }
+
+  getContactLid(number: string): Promise<string | null> {
+    return this.contacts.getContactLid(number);
   }
 
   getGroups(): Promise<Group[]> {
@@ -664,6 +678,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     return this.messaging.getMessageReactions(chatId, messageId);
   }
 
+  getMessageReceipts(chatId: string, messageId: string): Promise<MessageReceipts> {
+    return this.messaging.getMessageReceipts(chatId, messageId);
+  }
+
   // Labels (Phase 3) - WhatsApp Business only
   getLabels(): Promise<Label[]> {
     return this.labels.getLabels();
@@ -734,14 +752,14 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
   // method reads as the 501 it is, and TypeScript accepts the narrower signature for the interface.
   // eslint-disable-next-line @typescript-eslint/require-await
   async clickButton(): Promise<MessageResult> {
-    throw new EngineNotSupportedError('clickButton');
+    throw markNothingSent(new EngineNotSupportedError('clickButton'));
   }
 
   unpinMessage(chatId: string, messageId: string): Promise<void> {
     return this.messaging.unpinMessage(chatId, messageId);
   }
 
-  deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<void> {
+  deleteMessage(chatId: string, messageId: string, forEveryone: boolean = true): Promise<string | void> {
     return this.messaging.deleteMessage(chatId, messageId, forEveryone);
   }
 
@@ -838,6 +856,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
 
   setGroupEphemeral(groupId: string, durationSec: number): Promise<void> {
     return this.groups.setGroupEphemeral(groupId, durationSec);
+  }
+
+  setGroupMemberLabel(groupId: string, label: string): Promise<void> {
+    return this.groups.setGroupMemberLabel(groupId, label);
   }
 
   getGroupMembershipRequests(groupId: string): Promise<GroupMembershipRequest[]> {
@@ -960,11 +982,10 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     // Post-READY navigation window: window.WWebJS is gone until the re-inject completes, so every
     // delegate evaluate would die as a raw TypeError 500 (and five raw send failures latch the send
     // breaker for its 15-minute cooldown). Answer the same retryable 409 the pre-READY states get,
-    // naming the reload so the operator can tell this state from a plain disconnect (#1081).
-    if (this.lifecycle.isInNavigationReinjectWindow()) {
-      throw new EngineNotReadyError(
-        'WhatsApp Web is reloading its page and the session is re-injecting. Retry in a few seconds.',
-      );
+    // naming the reload so the operator can tell this state from a plain disconnect (#1081). Past the
+    // window the same holds for a reloaded page a liveness probe has read without its helpers.
+    if (this.lifecycle.isInNavigationReinjectWindow() || this.lifecycle.isPageWithoutHelpers()) {
+      throw new EnginePageReloadingError();
     }
   }
 
@@ -973,7 +994,7 @@ export class WhatsAppWebJsAdapter implements IWhatsAppEngine {
     // upstream wwebjs#201823 — WA Web removed Msg.avParams). Text→channel works; media does not.
     // Fail fast with a typed 501 instead of surfacing the raw TypeError as a 500 (#673).
     if (isChannelJid(chatId)) {
-      throw new ChannelMediaNotSupportedError();
+      throw markNothingSent(new ChannelMediaNotSupportedError());
     }
   }
 }

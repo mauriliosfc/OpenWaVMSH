@@ -139,7 +139,7 @@ describe('SessionEngineLifecycle races', () => {
           provide: ConfigService,
           useValue: { get: jest.fn(<T>(key: string, def?: T): T => (key in config ? (config[key] as T) : (def as T))) },
         },
-        { provide: LidMappingStoreService, useValue: { remember: jest.fn() } },
+        { provide: LidMappingStoreService, useValue: { remember: jest.fn(), onSecondLid: jest.fn() } },
         { provide: StatusStoreService, useValue: { ingest: jest.fn() } },
       ],
     }).compile();
@@ -951,6 +951,49 @@ describe('SessionEngineLifecycle races', () => {
 
       expect(internals.engines.has(ID)).toBe(false);
       expect(state.timer).not.toBeNull();
+    });
+
+    it('removes the orphan engine from EngineRegistry BEFORE awaiting destroyWithEscalation', async () => {
+      const module = await Test.createTestingModule({
+        providers: [
+          SessionEngineLifecycle,
+          { provide: ConfigService, useValue: { get: () => undefined } },
+          { provide: getRepositoryToken(Session, 'data'), useValue: { findOne: jest.fn(), update: jest.fn() } },
+          { provide: getRepositoryToken(Message, 'data'), useValue: {} },
+          { provide: getDataSourceToken('data'), useValue: {} },
+          { provide: EngineFactory, useValue: {} },
+          EngineRegistry,
+          { provide: SessionLidResolver, useValue: {} },
+          { provide: SessionLivenessWatchdog, useValue: { clear: jest.fn() } },
+          { provide: MessageProjector, useValue: {} },
+          { provide: LidMappingStoreService, useValue: { onSecondLid: jest.fn() } },
+          { provide: EventsGateway, useValue: { emitSessionStatus: jest.fn() } },
+          { provide: WebhookService, useValue: { dispatch: jest.fn() } },
+          { provide: HookManager, useValue: { execute: jest.fn() } },
+          { provide: StatusStoreService, useValue: {} },
+          SessionErrorStore,
+          SessionRestrictionStore,
+          PresenceStore,
+        ],
+      }).compile();
+
+      const lifecycle = module.get(SessionEngineLifecycle);
+      const engines = module.get(EngineRegistry);
+      const destroyGate = deferred<void>();
+      const engine = {
+        ...makeEngine(),
+        destroy: jest.fn(() => destroyGate.promise),
+      } as unknown as IWhatsAppEngine;
+      engines.set(ID, engine);
+
+      const pendingStop = lifecycle.stopOrphanEngines([ID]);
+      await flush();
+
+      // While destroy is still awaiting, the registry slot must already be evicted.
+      expect(engines.get(ID)).toBeUndefined();
+
+      destroyGate.resolve();
+      await expect(pendingStop).resolves.toEqual({ stopped: [ID], notRunning: [], failed: [] });
     });
   });
 });

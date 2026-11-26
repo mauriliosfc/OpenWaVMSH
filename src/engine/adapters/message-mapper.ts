@@ -89,10 +89,15 @@ export interface RawMessageFields {
   type: string;
   timestamp: number;
   fromMe: boolean;
+  /** The vCards of a contact message; whatsapp-web.js attaches the list to every Message. */
+  vCards?: string[];
   /** Set on group messages: the participant WID that actually sent the message. */
   author?: string;
   /** WIDs @mentioned in the message; whatsapp-web.js attaches this to every Message. */
   mentionedIds?: string[];
+  /** Whether the message was forwarded, and how many times; whatsapp-web.js sets both on every Message. */
+  isForwarded?: boolean;
+  forwardingScore?: number;
   /** Raw wwebjs payload; `notifyName` carries the sender's push name without an extra lookup. */
   _data?: { notifyName?: string; ephemeralDuration?: number };
   /** Set on `order` messages: the placed order's id, and the single-order token that unlocks its items. */
@@ -108,6 +113,15 @@ export interface RawMessageFields {
   description?: string;
   /** The catalog owner's JID, on a shared product card. */
   businessOwnerJid?: string;
+}
+
+/**
+ * The body of a whatsapp-web.js message. Several contacts shared together carry none: WhatsApp Web keeps
+ * their vCards in a list, joined here into the one multi-card body Baileys delivers for the same share.
+ */
+export function wwebjsBody(msg: Pick<RawMessageFields, 'body' | 'type' | 'vCards'>): string {
+  if (msg.type !== 'multi_vcard' || msg.body) return msg.body;
+  return (msg.vCards ?? []).filter(Boolean).join('\n');
 }
 
 /**
@@ -129,7 +143,7 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
     from: msg.from,
     to: msg.to,
     chatId,
-    body: msg.body,
+    body: wwebjsBody(msg),
     type: mapWwebjsMessageType(msg.type),
     timestamp: msg.timestamp,
     fromMe: msg.fromMe,
@@ -148,6 +162,16 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
   // @mentioned WIDs, when present — used for command targeting (e.g. `/tr grant @user`).
   if (msg.mentionedIds && msg.mentionedIds.length > 0) {
     incoming.mentionedIds = msg.mentionedIds;
+  }
+
+  // Forwarded content is not the sender's own words; surface that so consumers do not attribute it to them.
+  // whatsapp-web.js defaults forwardingScore to 0 when the raw payload carries no score at all, so the
+  // same positive-value gate the ephemeralDuration field above uses keeps a real 0 from reading as a signal.
+  if (msg.isForwarded === true) {
+    incoming.isForwarded = true;
+    if (typeof msg.forwardingScore === 'number' && msg.forwardingScore > 0) {
+      incoming.forwardingScore = msg.forwardingScore;
+    }
   }
 
   // Flag senders identified by a WhatsApp privacy id (`@lid`) so engine-neutral code can opt to
@@ -229,7 +253,7 @@ export function buildEditedMessage(message: IncomingMessage, hasMedia: boolean):
  * full wwebjs `Contact`, and so the async getters stay out by construction.
  */
 export interface RawContactFields {
-  id?: { _serialized?: string };
+  id?: SerializedWid;
   number?: string;
   name?: string;
   pushname?: string;
@@ -257,7 +281,7 @@ export function mapContactFields(contact: RawContactFields, full = false): Messa
   if (contact.name) out.name = contact.name;
   if (contact.pushname) out.pushName = contact.pushname;
   if (!full) return out;
-  const id = contact.id?._serialized;
+  const id = readWid(contact.id);
   if (id) out.id = id;
   if (contact.number) out.number = contact.number;
   if (contact.shortName) out.shortName = contact.shortName;

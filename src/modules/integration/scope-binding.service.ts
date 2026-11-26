@@ -5,6 +5,8 @@ import { Repository } from 'typeorm';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { AuditService } from '../audit/audit.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
+import { sessionScopeKey } from '../../core/plugins/plugin-activation';
+import { updatePluginConfigDurable } from '../../core/plugins/plugin-lifecycle';
 import { Session } from '../session/entities/session.entity';
 import { PluginInstanceService } from './plugin-instance.service';
 import { PluginInstance } from './entities/plugin-instance.entity';
@@ -61,7 +63,7 @@ export class ScopeBindingService implements OnApplicationBootstrap {
    * The boot pass itself, shared with {@link resyncAfterImport}. Rejects only when the instance rows
    * cannot be listed; a single binding failure is absorbed by applyScopeBinding.
    */
-  async reconcile(): Promise<void> {
+  async reconcile(previousWildcardConfigs?: ReadonlyMap<string, Record<string, unknown>>): Promise<void> {
     const rows = await this.instances.listAll();
 
     // Order-independent reconciliation: listAll() is repo.find() with no ORDER BY, so its row order
@@ -84,7 +86,11 @@ export class ScopeBindingService implements OnApplicationBootstrap {
       if (!inst.enabled) continue;
       // Skip instances whose plugin isn't loaded — applyScopeBinding would only no-op/log for them.
       if (!this.loader.getPlugin(inst.pluginId)) continue;
-      await this.applyScopeBinding(inst.pluginId, inst.sessionScope, inst.config ?? {}, true, { additive: true });
+      const isWildcard = !inst.sessionScope || inst.sessionScope === '*';
+      await this.applyScopeBinding(inst.pluginId, inst.sessionScope, inst.config ?? {}, true, {
+        additive: true,
+        previousConfig: isWildcard ? previousWildcardConfigs?.get(inst.pluginId) : undefined,
+      });
       await this.warnIfScopeHasNoSession(inst);
       count++;
     }
@@ -112,24 +118,50 @@ export class ScopeBindingService implements OnApplicationBootstrap {
    * checks read the restored rows.
    */
   async resyncAfterImport(
-    previous: ReadonlyArray<{ pluginId: string; sessionScope: string | null; enabled: boolean }>,
+    previous: ReadonlyArray<{
+      pluginId: string;
+      instanceId?: string;
+      sessionScope: string | null;
+      enabled: boolean;
+      config?: Record<string, unknown> | null;
+    }>,
   ): Promise<void> {
-    const scopeKey = (scope: string | null): string => (!scope || scope === '*' ? '*' : scope);
     const bound = new Set(
       (await this.instances.listAll())
         .filter(row => row.enabled)
-        .map(row => `${row.pluginId}\u0000${scopeKey(row.sessionScope)}`),
+        .map(row => `${row.pluginId}\u0000${sessionScopeKey(row.sessionScope)}`),
     );
+    const previousWildcardConfigs = new Map<string, Record<string, unknown>>();
+    const wildcardRows = previous
+      .filter(row => row.enabled && sessionScopeKey(row.sessionScope) === '*' && row.config)
+      .slice()
+      .sort((a, b) => String(a.instanceId ?? '').localeCompare(String(b.instanceId ?? '')));
+    for (const row of wildcardRows) {
+      const currentPluginConfig = this.loader.getPlugin(row.pluginId)?.config;
+      const merged = { ...(previousWildcardConfigs.get(row.pluginId) ?? {}) };
+      for (const [key, value] of Object.entries(row.config ?? {})) {
+        if (!isDefined(value) && isDefined(merged[key])) continue;
+        if (isDefined(merged[key]) && isDeepStrictEqual(currentPluginConfig?.[key], merged[key])) continue;
+        merged[key] = value;
+      }
+      if (Object.keys(merged).length > 0) {
+        previousWildcardConfigs.set(row.pluginId, merged);
+      }
+    }
     const retired = new Map<string, { pluginId: string; sessionScope: string | null }>();
     for (const row of previous) {
-      const key = `${row.pluginId}\u0000${scopeKey(row.sessionScope)}`;
+      const key = `${row.pluginId}\u0000${sessionScopeKey(row.sessionScope)}`;
       if (row.enabled && !bound.has(key)) retired.set(key, row);
     }
     for (const { pluginId, sessionScope } of retired.values()) {
       if (!this.loader.getPlugin(pluginId)) continue;
-      await this.applyScopeBinding(pluginId, sessionScope, {}, false, { additive: true });
+      const isWildcard = sessionScopeKey(sessionScope) === '*';
+      await this.applyScopeBinding(pluginId, sessionScope, {}, false, {
+        additive: true,
+        previousConfig: isWildcard ? previousWildcardConfigs.get(pluginId) : undefined,
+      });
     }
-    await this.reconcile();
+    await this.reconcile(previousWildcardConfigs);
   }
 
   /**
@@ -198,6 +230,9 @@ export class ScopeBindingService implements OnApplicationBootstrap {
     opts: { additive?: boolean; previousConfig?: Record<string, unknown> | null } = {},
   ): Promise<void> {
     try {
+      // A global (sessionScoped: false) plugin has no session activation or per-session config, and the loader
+      // refuses both; dispatch layers each instance's own row for it. Only a wildcard's base config applies.
+      const globalPlugin = this.loader.getPlugin(pluginId)?.manifest.sessionScoped === false;
       if (!scope || scope === '*') {
         // 'all sessions' → base config + activate ['*']. The merged base config cannot be cleanly torn
         // down (updatePluginConfig merges, so one instance's keys aren't separable), but the '*'
@@ -205,15 +240,16 @@ export class ScopeBindingService implements OnApplicationBootstrap {
         // enabled instance still binds a wildcard/null scope — otherwise disabling/deleting a wildcard
         // instance would leave the plugin firing on every session with stale config.
         if (activate) {
-          this.loader.updatePluginConfig(pluginId, {
+          await this.updateBaseConfig(pluginId, {
             ...(await this.retractedSecrets(pluginId, config, opts.previousConfig)),
             ...config,
           });
-          this.loader.setPluginSessions(pluginId, ['*']);
+          if (!globalPlugin) this.loader.setPluginSessions(pluginId, ['*']);
           return;
         }
         const retracted = await this.retractedSecrets(pluginId, {}, opts.previousConfig);
-        if (Object.keys(retracted).length > 0) this.loader.updatePluginConfig(pluginId, retracted);
+        if (Object.keys(retracted).length > 0) await this.updateBaseConfig(pluginId, retracted);
+        if (globalPlugin) return;
         const rows = await this.instances.list(pluginId);
         const anyWildcardLeft = rows.some(i => i.enabled && (!i.sessionScope || i.sessionScope === '*'));
         if (!anyWildcardLeft) {
@@ -225,6 +261,7 @@ export class ScopeBindingService implements OnApplicationBootstrap {
         }
         return;
       }
+      if (globalPlugin) return;
       // Concrete scope → per-session config + toggle that session in activeSessions. Mirror the
       // wildcard path's retirement guard in BOTH directions: runtime state a still-ENABLED sibling
       // instance depends on must survive this instance's change. The controller persists the row
@@ -282,6 +319,27 @@ export class ScopeBindingService implements OnApplicationBootstrap {
   }
 
   /**
+   * Project a wildcard config patch onto the plugin's base config and sanitize any persisted
+   * instances whose config inherits a redirected base host key in a single durable pass.
+   */
+  private async updateBaseConfig(pluginId: string, patch: Record<string, unknown>): Promise<void> {
+    const plugin = this.loader.getPlugin(pluginId);
+    if (!plugin) {
+      this.loader.updatePluginConfig(pluginId, patch);
+      return;
+    }
+    if (await updatePluginConfigDurable(plugin, patch)) return;
+    // Fallback when `this.loader` is a test double without a live PluginLifecycle.
+    const previousBase = plugin.config ? { ...plugin.config } : undefined;
+    this.loader.updatePluginConfig(pluginId, patch);
+    if (!previousBase) return;
+    const currentBase = this.loader.getPlugin(pluginId)?.config;
+    const nextBase =
+      currentBase && !isDeepStrictEqual(currentBase, previousBase) ? currentBase : { ...previousBase, ...patch };
+    await this.instances.sanitizeForBaseRedirect?.(pluginId, previousBase, nextBase, plugin.manifest);
+  }
+
+  /**
    * What to write over the base config to take back the secrets `previous` held and `config` no longer
    * defines (none, for a teardown). The wildcard projection only merges, so on its own it cannot delete a
    * key: a secret the operator revoked, or one of an instance that was disabled, deleted or moved off the
@@ -306,7 +364,7 @@ export class ScopeBindingService implements OnApplicationBootstrap {
         !isDefined(config[key]) &&
         // Only what this instance put there: a value set on the plugin since, or one a sibling projected
         // after it, is not the instance's to take back.
-        isDeepStrictEqual(plugin?.config[key], before[key]),
+        isDeepStrictEqual(plugin?.config?.[key], before[key]),
     );
     if (removed.length === 0) return {};
     const siblings = (await this.instances.list(pluginId))

@@ -1,9 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizePhoneText } from './phone.ts';
+import { normalizePhoneDigits, normalizePhoneText, phoneQueryDigits } from './phone.ts';
 
 const char = (code: number) => String.fromCharCode(code);
 const digitsOf = (zero: number) => [...'0123456789'].map(d => char(zero + Number(d))).join('');
+
+test('international phone digits drop formatting and one exit code in any digit script', () => {
+  for (const text of ['00376 612 345', '+376 (612) 345', '376612345']) {
+    assert.equal(normalizePhoneDigits(text), '376612345');
+  }
+  const native = [...'00376612345'].map(d => char(0x0660 + Number(d))).join('');
+  assert.equal(normalizePhoneDigits(native), '376612345');
+  assert.equal(normalizePhoneDigits('001234'), '1234');
+  assert.equal(normalizePhoneDigits('00 123 456 789 012 345'), '123456789012345');
+  assert.equal(normalizePhoneDigits('08123456789'), '08123456789');
+});
 
 test('the digits of any script read as ASCII digits', () => {
   for (const zero of [0x0660, 0x06f0, 0x0966, 0x0c66, 0xff10]) {
@@ -55,4 +66,10 @@ test('the Mathematical digit sets read as ASCII digits', () => {
     const digits = [...'0123456789'].map(d => String.fromCodePoint(zero + Number(d))).join('');
     assert.equal(normalizePhoneText(digits), '0123456789');
   }
+});
+
+test('a query gives digits to match numbers with only when it reads as a phone number', () => {
+  assert.equal(phoneQueryDigits(' +62 (812) 345-67.89 '), '628123456789');
+  assert.equal(phoneQueryDigits(`${char(0xff0b)}${digitsOf(0x0660).slice(1, 4)}`), '123');
+  for (const query of ['Shop 2', 'Team-2', '2nd floor', 'a+1', '']) assert.equal(phoneQueryDigits(query), '', query);
 });

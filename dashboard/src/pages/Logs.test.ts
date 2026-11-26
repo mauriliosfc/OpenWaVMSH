@@ -102,8 +102,8 @@ function installFetchStub(): void {
     if (listFailure && !url.includes('limit=200')) {
       return Promise.resolve(new Response(JSON.stringify({ message: 'Bad Gateway' }), { status: listFailure }));
     }
-    // The gateway holds no error rows, so the server-side severity filter matches nothing.
-    if (new URL(url, 'http://localhost').searchParams.get('severity') === 'error') {
+    // No row of this fixture is a warning, so the server-side severity filter for it matches nothing.
+    if (new URL(url, 'http://localhost').searchParams.get('severity') === 'warn') {
       return Promise.resolve(jsonResponse({ data: [], total: 0 }));
     }
     const reply = jsonResponse({ data: LOGS, total: listTotal ?? LOGS.length });
@@ -307,14 +307,43 @@ test('an exported cell that starts like a formula is neutralized', async () => {
   }
 });
 
+// The session, the key and the address are cut with an ellipsis where their cell is narrow, so each carries its whole
+// value in a title; a row without that value has nothing to show.
+test('a cell that the table may cut carries its whole value in a title', async () => {
+  const named: AuditLog = {
+    ...LOG_FAILED_SEND,
+    id: 'row-named',
+    action: 'key.rotate',
+    apiKeyName: 'reporting-integration-production-key',
+    ipAddress: '2001:0db8:85a3:0000:0000:8a2e:0370:7334',
+  };
+  LOGS.push(named);
+  try {
+    const container = renderLogs();
+    await rtl.screen.findByText('key.rotate');
+    const titles = (row: Element) =>
+      ['.session', '.api-key', '.ip'].map(cell => row.querySelector(cell)?.getAttribute('title') ?? null);
+    const rows = Array.from(container.querySelectorAll('.logs-table .table-row:not(.header)'));
+    assert.deepEqual(titles(rows[0]), [null, null, null]);
+    assert.deepEqual(titles(rows[2]), ['billing-bot', named.apiKeyName, named.ipAddress]);
+  } finally {
+    LOGS.pop();
+  }
+});
+
 test('the table grid declares one column track per rendered cell', async () => {
   const container = renderLogs();
   await rtl.screen.findByText('infra.restart');
   const css = readFileSync(fileURLToPath(new URL('./Logs.css', import.meta.url)), 'utf8');
-  const template = css.match(/\.logs-table \.table-row \{[^}]*grid-template-columns: ([^;]+);/)?.[1];
+  const template = css.match(/\.logs-table \.table-row \{[^}]*grid-template-columns:\s*([^;]+);/)?.[1];
   assert.ok(template, 'the row grid template was not found');
+  // A minmax() track holds a space of its own, so the tracks are counted outside the parentheses.
+  const tracks = template
+    .replace(/\([^)]*\)/g, '')
+    .trim()
+    .split(/\s+/);
   for (const row of container.querySelectorAll('.logs-table .table-row')) {
-    assert.equal(template.split(/\s+/).length, row.children.length, template);
+    assert.equal(tracks.length, row.children.length, template);
   }
 });
 
@@ -344,14 +373,44 @@ test('typing a search on a later page keeps the search box mounted while page on
   }
 });
 
+// The pager's numbers are plain buttons, and the page shown is told only by a class: a screen reader hears 1, 2 and 3 with
+// no hint of which one is current.
+test('the pager marks the current page for assistive technology', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  listTotal = 60;
+  try {
+    renderLogs();
+    await screen.findByText('infra.restart');
+    const current = (): Array<string | null> =>
+      ['1', '2', '3'].map(name => screen.getByRole('button', { name }).getAttribute('aria-current'));
+    assert.deepEqual(current(), ['page', null, null]);
+    fireEvent.click(screen.getByRole('button', { name: '3' }));
+    await waitFor(() => assert.deepEqual(current(), [null, null, 'page']));
+    await screen.findByText('infra.restart');
+  } finally {
+    listTotal = null;
+  }
+});
+
 test('a severity filter that matches nothing says no logs exist, not that this page has none', async () => {
   const { screen, fireEvent } = rtl;
   renderLogs();
   await screen.findByText('infra.restart');
-  fireEvent.click(screen.getByRole('button', { name: 'All Severities' }));
-  fireEvent.click(screen.getByRole('option', { name: 'Error' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Severity, All Severities' }));
+  fireEvent.click(screen.getByRole('option', { name: 'Warning' }));
   await screen.findByText('No logs match these filters. Adjust the severity filter to widen the search.');
   assert.ok(screen.getByRole('heading', { name: 'No logs found' }));
+});
+
+// The gateway writes audit rows as info or warn only, failures included, so an Error filter could only ever show an
+// empty table, and an admin looking for failures would read it as nothing having failed.
+test('the severity filter offers only the severities the gateway writes', async () => {
+  const { screen, fireEvent } = rtl;
+  renderLogs();
+  await screen.findByText('infra.restart');
+  fireEvent.click(screen.getByRole('button', { name: 'Severity, All Severities' }));
+  const offered = screen.getAllByRole('option').map(option => option.textContent);
+  assert.deepEqual(offered, ['All Severities', 'Info', 'Warning']);
 });
 
 test('the severity badge shows the translated severity', async () => {
@@ -359,6 +418,18 @@ test('the severity badge shows the translated severity', async () => {
   await rtl.screen.findByText('infra.restart');
   const badges = [...container.querySelectorAll('.severity-badge')].map(badge => badge.textContent);
   assert.deepEqual(badges, ['Info', 'Error']);
+});
+
+// A row's message is the only place some actions name what happened, such as the number and ids of a
+// phone_second_lid_reported row, so it is shown with the action rather than only searched and exported.
+test('a row shows its message under its action, and a row without one shows none', async () => {
+  const container = renderLogs();
+  const message = await rtl.screen.findByText('SESSION_STOP_INCOMPLETE');
+  assert.equal(message.closest('.action')?.firstChild?.textContent, 'session.stop');
+  const nullRow = [...container.querySelectorAll('.logs-table .action')].find(cell =>
+    cell.textContent?.startsWith('infra.restart'),
+  );
+  assert.equal(nullRow?.textContent, 'infra.restart');
 });
 
 test('the search matches errorMessage as well as action, whatever the case', async () => {

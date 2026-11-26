@@ -7,7 +7,8 @@ import { formatPhoneForDisplay, isolateNumber } from '../../utils/formatPhone';
 import { useRole } from '../../hooks/useRole';
 import { useToast } from '../../hooks/useToast';
 import ChatAvatar from './ChatAvatar';
-import { normalizePhoneText } from '../../utils/phone';
+import { normalizePhoneDigits, normalizePhoneText, phoneQueryDigits } from '../../utils/phone';
+import { isComposingKey } from '../../utils/composition';
 
 type Mode = 'chat' | 'group';
 
@@ -25,9 +26,10 @@ interface NewChatPanelProps {
   onOpenChat: (chat: Chat, sessionId: string) => void;
   /**
    * The id the chat list holds a phone-based id's conversation under when that is another id of the same contact
-   * (one that moved to privacy-id addressing keeps its chat under its @lid), or null when the list has none.
+   * (one that moved to privacy-id addressing keeps its chat under its @lid), or null when the list has none. The
+   * search ends, with no further request, once `isWanted` answers false.
    */
-  findListedChat?: (phoneId: string) => Promise<string | null>;
+  findListedChat?: (phoneId: string, isWanted?: () => boolean) => Promise<string | null>;
   onClose: () => void;
 }
 
@@ -43,8 +45,8 @@ const toInternationalDigits = (input: string): string | null => {
   const trimmed = input.trim();
   if (!trimmed || /[a-z]/i.test(trimmed)) return null;
   let digits = normalizePhoneText(trimmed).replace(/\D/g, '');
-  if (digits.startsWith('00')) digits = digits.slice(2);
-  else if (!trimmed.startsWith('+') && digits.startsWith('0')) return null;
+  if (!digits.startsWith('00') && !trimmed.startsWith('+') && digits.startsWith('0')) return null;
+  digits = normalizePhoneDigits(digits);
   return digits.length >= 7 && digits.length <= 15 ? digits : null;
 };
 
@@ -118,7 +120,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
   }, [contactsQuery.data]);
 
   const normalizedQuery = query.trim().toLowerCase();
-  const queryDigits = normalizePhoneText(query).replace(/\D/g, '');
+  const queryDigits = phoneQueryDigits(query);
   const visibleContacts = normalizedQuery
     ? contacts.filter(
         c =>
@@ -139,7 +141,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
   const resolveNumber = async (
     digits: string,
     label: string,
-    listedAs?: (phoneId: string) => Promise<string | null>,
+    listedAs?: (phoneId: string, isWanted?: () => boolean) => Promise<string | null>,
   ): Promise<string | null> => {
     setChecking(true);
     try {
@@ -151,7 +153,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
       }
       // A conversation the list keeps under another id of the same contact is the one to open. Failing to
       // find it is no reason to fail the number, which opens a new chat as it would for any other.
-      const listed = listedAs ? await listedAs(res.whatsappId).catch(() => null) : null;
+      const listed = listedAs ? await listedAs(res.whatsappId, () => openRef.current).catch(() => null) : null;
       return listed ?? res.whatsappId;
     } catch (err) {
       if (openRef.current) {
@@ -168,6 +170,21 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
     const id = await resolveNumber(typedNumber, typedNumberLabel, findListedChat);
     if (id && openRef.current) onOpenChat(draftChat(id, '', 'individual'), sessionId);
   };
+
+  // The address book lists a contact under its phone id, while the list can keep the conversation under another id of
+  // the same person (its @lid once WhatsApp moved it to privacy-id addressing): that conversation is the one to open,
+  // as for a typed number. The lookup can take a few seconds, so the panel takes no other pick meanwhile; one that
+  // fails or finds nothing opens the contact's own chat.
+  const [openingContact, setOpeningContact] = useState<string | null>(null);
+  const handleOpenContact = async (contact: Contact) => {
+    if (openingContact !== null || checking) return;
+    setOpeningContact(contact.id);
+    const listed = findListedChat ? await findListedChat(contact.id, () => openRef.current).catch(() => null) : null;
+    if (!openRef.current) return;
+    setOpeningContact(null);
+    onOpenChat(draftChat(listed ?? contact.id, contact.name || '', 'individual'), sessionId);
+  };
+  const busy = checking || openingContact !== null;
 
   const toggleParticipant = (p: Participant) => {
     setParticipants(prev => (prev.some(x => x.id === p.id) ? prev.filter(x => x.id !== p.id) : [...prev, p]));
@@ -268,7 +285,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
           value={query}
           onChange={e => setQuery(e.target.value)}
           onKeyDown={e => {
-            if (e.key === 'Enter' && typedNumber && !checking) {
+            if (e.key === 'Enter' && !isComposingKey(e.nativeEvent) && typedNumber && !busy) {
               e.preventDefault();
               submitTypedNumber();
             }
@@ -295,7 +312,12 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
 
       <div className="chats-list new-chat-list">
         {!isGroupMode && groupsSupported && !normalizedQuery && (
-          <button type="button" className="chat-item-card action-row" onClick={() => switchMode('group')}>
+          <button
+            type="button"
+            className="chat-item-card action-row"
+            disabled={busy}
+            onClick={() => switchMode('group')}
+          >
             <span className="chat-avatar avatar-md action-avatar">
               <Users size={22} />
             </span>
@@ -304,7 +326,7 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
         )}
 
         {typedNumber && (
-          <button type="button" className="chat-item-card action-row" disabled={checking} onClick={submitTypedNumber}>
+          <button type="button" className="chat-item-card action-row" disabled={busy} onClick={submitTypedNumber}>
             <span className="chat-avatar avatar-md action-avatar">
               {checking ? <Loader2 className="animate-spin" size={22} /> : <Phone size={22} />}
             </span>
@@ -344,13 +366,17 @@ function NewChatPanel({ sessionId, onOpenChat, findListedChat, onClose }: NewCha
                 key={c.id}
                 className={`chat-item-card ${selected ? 'active' : ''}`}
                 aria-pressed={isGroupMode ? selected : undefined}
-                onClick={() =>
-                  isGroupMode
-                    ? toggleParticipant({ id: c.id, label })
-                    : onOpenChat(draftChat(c.id, c.name || '', 'individual'), sessionId)
-                }
+                aria-busy={openingContact === c.id || undefined}
+                disabled={!isGroupMode && busy}
+                onClick={() => (isGroupMode ? toggleParticipant({ id: c.id, label }) : void handleOpenContact(c))}
               >
-                <ChatAvatar kind="individual" />
+                {openingContact === c.id ? (
+                  <span className="chat-avatar avatar-md action-avatar">
+                    <Loader2 className="animate-spin" size={22} />
+                  </span>
+                ) : (
+                  <ChatAvatar chatId={c.id} kind="individual" />
+                )}
                 <span className="chat-item-info">
                   <span className="chat-item-name">{label}</span>
                   {phone && phone !== label && (

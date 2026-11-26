@@ -59,6 +59,14 @@ describe('GroupsResource — exact paths and bodies', () => {
     expect(t.lastCall!.url).toContain('/invite-code/revoke');
   });
 
+  it('setMemberLabel PUTs the label to the group', async () => {
+    const t = new MockTransport().on('PUT', /\/member-label$/, { body: { success: true } });
+    await client(t).groups.setMemberLabel('s', 'g@g.us', 'Site A');
+    expect(t.lastCall!.method).toBe('PUT');
+    expect(t.lastCall!.url).toContain('/api/sessions/s/groups/g@g.us/member-label');
+    expect(t.lastCall!.body).toEqual({ label: 'Site A' });
+  });
+
   it('membership requests — list, approve, reject', async () => {
     const t = new MockTransport()
       .on('GET', /\/membership-requests$/, { body: [{ participantId: 'a@c.us', method: 'invite_link' }] })
@@ -191,6 +199,14 @@ describe('ContactsResource — exact paths', () => {
     expect(t.lastCall!.url).toContain('/check/628123');
     await c.contacts.profilePicture('s', 'a@c.us');
     await c.contacts.phone('s', 'x@lid');
+  });
+
+  it('lid: GET /contacts/{number}/lid, and a null lid comes through', async () => {
+    const t = new MockTransport().on('GET', /\/lid$/, { body: { number: '628123', lid: null } });
+    const res = await client(t).contacts.lid('s', '628123');
+    expect(t.lastCall!.method).toBe('GET');
+    expect(t.lastCall!.url).toContain('/api/sessions/s/contacts/628123/lid');
+    expect(res.lid).toBeNull();
   });
 
   it('block (POST) / unblock (DELETE)', async () => {
@@ -403,6 +419,21 @@ describe('ChatsResource last-message metadata', () => {
   });
 });
 
+describe('ChatsResource phone of a privacy-id chat', () => {
+  it('keeps the phone the server lists and leaves a chat without one with none', async () => {
+    const t = new MockTransport().on('GET', /\/chats$/, {
+      body: [
+        { id: '262813461250072@lid', name: '', phone: '15550006666' },
+        { id: '15550001111@c.us', name: 'Alice' },
+      ],
+    });
+    const chats = await client(t).chats.list('s');
+    expect(chats[0].phone).toBe('15550006666');
+    expect(chats[0].name).toBe('');
+    expect(chats[1].phone).toBeUndefined();
+  });
+});
+
 describe('ChatsResource.clearMessages', () => {
   it('DELETEs the chat messages sub-resource', async () => {
     const t = new MockTransport().on('DELETE', /\/chats\/.+\/messages$/, { body: { success: true } });
@@ -538,6 +569,14 @@ describe('SearchResource — exact path and query forwarding', () => {
     const c = client(t);
     await c.search.search({ q: 'term', chatId: '628@c.us', direction: 'incoming' });
     expect(t.lastCall!.url).toBe('http://x/api/search?q=term&chatId=628%40c.us&direction=incoming');
+  });
+
+  it('forwards the match mode', async () => {
+    const t = new MockTransport().on('GET', /\/search$/, {
+      body: { hits: [], total: 0, tookMs: 1, provider: 'builtin-fts' },
+    });
+    await client(t).search.search({ q: 'voic', match: 'contains' });
+    expect(t.lastCall!.url).toBe('http://x/api/search?q=voic&match=contains');
   });
 });
 

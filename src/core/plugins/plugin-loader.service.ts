@@ -15,7 +15,7 @@ import {
   PluginStatus,
   PluginType,
 } from './plugin.interfaces';
-import { PluginStorageService } from './plugin-storage.service';
+import { PluginStorageService, type RegistryWriteOptions } from './plugin-storage.service';
 import { PluginHostServices } from './plugin-host-services';
 import type { PluginConversationMappingPort } from './plugin-host-ports';
 import { PluginCapabilityContext } from './plugin-capability-context';
@@ -23,9 +23,9 @@ import { PluginSandboxBridge } from './plugin-sandbox-bridge';
 import { PluginPackageScanner } from './plugin-package-scanner';
 import { PluginLifecycle } from './plugin-lifecycle';
 import { PluginUninstaller } from './plugin-uninstaller';
-import { PluginWorkerHost } from './sandbox/plugin-worker-host';
+import { PluginWorkerHost, type CapabilityDispatcher } from './sandbox/plugin-worker-host';
 import { WorkerThreadChannel } from './sandbox/worker-thread-channel';
-import { PluginLogLevel } from './sandbox/protocol';
+import { PluginLogLevel, SANDBOX_MAX_INFLIGHT_CAPS } from './sandbox/protocol';
 import { resolvePluginMainPath } from './plugin-paths';
 import type { IngressJobData } from '../../modules/queue/processors/ingress.processor';
 
@@ -40,12 +40,6 @@ export {
 
 /** Default per-plugin heap cap for the sandbox worker; an OOM terminates the worker, not the host. */
 const SANDBOX_MAX_OLD_GEN_MB = 256;
-
-/**
- * Max concurrent worker-initiated capability calls per sandboxed plugin. A burst beyond this is rejected
- * (the plugin sees a thrown Error) rather than amplified into unbounded host-side sends/fetches/writes.
- */
-const SANDBOX_MAX_INFLIGHT_CAPS = 32;
 
 /**
  * Host-side budget for ONE worker-initiated capability call. A plugin whose calls hang would otherwise
@@ -203,6 +197,7 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
         onSearchProviderRegister,
         onWorkerExit,
         onUnresponsive,
+        livenessIntervalMs,
       ) =>
         this.createSandboxHost(
           capDispatcher,
@@ -213,6 +208,7 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
           onSearchProviderRegister,
           onWorkerExit,
           onUnresponsive,
+          livenessIntervalMs,
         ),
       // Exported from this module (specs import it here); passed so the bridge never imports back.
       resolvePluginMainPath,
@@ -493,20 +489,25 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
     return this.pluginStorage.getPluginEntry(pluginId)?.builtIn ?? false;
   }
 
-  uninstallPlugin(pluginId: string): Promise<void> {
+  uninstallPlugin(pluginId: string): Promise<{ registryEntryKept: boolean }> {
     return this.uninstaller.uninstallPlugin(pluginId);
   }
 
-  updatePluginConfig(pluginId: string, config: Record<string, unknown>): void {
-    this.lifecycle.updatePluginConfig(pluginId, config);
+  updatePluginConfig(pluginId: string, config: Record<string, unknown>, opts?: RegistryWriteOptions): void {
+    this.lifecycle.updatePluginConfig(pluginId, config, opts);
   }
 
-  setPluginSessions(pluginId: string, sessions: string[]): PluginInstance {
-    return this.lifecycle.setPluginSessions(pluginId, sessions);
+  setPluginSessions(pluginId: string, sessions: string[], opts?: RegistryWriteOptions): PluginInstance {
+    return this.lifecycle.setPluginSessions(pluginId, sessions, opts);
   }
 
-  setPluginSessionConfig(pluginId: string, sessionId: string, config: Record<string, unknown>): PluginInstance {
-    return this.lifecycle.setPluginSessionConfig(pluginId, sessionId, config);
+  setPluginSessionConfig(
+    pluginId: string,
+    sessionId: string,
+    config: Record<string, unknown>,
+    opts?: RegistryWriteOptions,
+  ): PluginInstance {
+    return this.lifecycle.setPluginSessionConfig(pluginId, sessionId, config, opts);
   }
 
   /** Health across both tiers; the sandbox-routing implementation lives in PluginSandboxBridge. */
@@ -516,10 +517,10 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
 
   /**
    * Ingress dispatch into the plugin's live sandbox worker; implemented by PluginSandboxBridge.
-   * The public contract (callers: IngressProcessor, IngressEnqueueService) is unchanged.
+   * Queued dispatch gets a longer processing budget after the provider is acknowledged.
    */
-  dispatchWebhookForInstance(d: IngressJobData): Promise<void> {
-    return this.sandboxBridge.dispatchWebhookForInstance(d);
+  dispatchWebhookForInstance(d: IngressJobData, options?: { queued?: boolean }): Promise<void> {
+    return this.sandboxBridge.dispatchWebhookForInstance(d, options);
   }
 
   /**
@@ -527,7 +528,7 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
    * instead of spawning a real OS thread. Production loads the compiled worker bootstrap from dist.
    */
   protected createSandboxHost(
-    capDispatcher?: (verb: string, args: unknown[]) => Promise<unknown>,
+    capDispatcher?: CapabilityDispatcher,
     onHookSubscribe?: (event: string, priority?: number) => void,
     onWebhookSubscribe?: (route: string) => void,
     onLog?: (level: PluginLogLevel, message: string, meta?: Record<string, unknown>) => void,
@@ -535,6 +536,7 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
     onSearchProviderRegister?: () => void,
     onWorkerExit?: (code: number, intentional: boolean, reason?: string) => void,
     onUnresponsive?: () => void,
+    livenessIntervalMs = 30_000,
   ): PluginWorkerHost {
     const workerEntry = path.join(__dirname, 'sandbox', 'worker-bootstrap.js');
     return new PluginWorkerHost(
@@ -555,6 +557,7 @@ export class PluginLoaderService implements OnModuleInit, OnApplicationBootstrap
       this.configService.get<number>('plugins.capTimeoutMs') ?? SANDBOX_CAP_TIMEOUT_MS,
       SANDBOX_LIVENESS_TIMEOUT_MS,
       onUnresponsive,
+      livenessIntervalMs,
     );
   }
 

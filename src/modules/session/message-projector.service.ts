@@ -1,24 +1,29 @@
+import { randomUUID } from 'node:crypto';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { Injectable, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In, Not } from 'typeorm';
+import { EntityManager, Repository, In, IsNull, Not, Or } from 'typeorm';
 import { QueryDeepPartialEntity } from 'typeorm';
 import { Session } from './entities/session.entity';
 import { Message, MessageDirection, MessageStatus } from '../message/entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { KeyedMutationQueue } from '../../common/utils/keyed-mutation-queue';
 import { awaitNoOpenTransaction } from '../../common/utils/shared-connection';
+import { captureSessionWrites } from '../../common/utils/session-write-scope';
 import { SessionLidResolver } from './session-lid-resolver.service';
+import { SessionOwnershipService } from './session-ownership.service';
 import { buildMessageMetadata, REVOKED_ROW_PATCH, storableWaMessageId } from './message-row.mapper';
 import { MessageMutationProjector } from './message-mutation-projector';
 import {
   mutationTargetsForeignRow,
   mutationTargetsForeignRowPersisted,
+  receiptTargetsForeignRow,
+  receiptTargetsForeignRowPersisted,
   type MutationSource,
   type StoredMessageRef,
 } from './message-mutation-guard';
-import { updateMessageMetadata } from '../message/message-metadata';
+import { mergeSentMetadata, updateMessageMetadata } from '../message/message-metadata';
 import { persistHistoryMessages } from './message-history-projector';
 import { isTransientDbError, isUniqueViolation } from '../../common/utils/db-errors';
 import { resolveFeatureFlags } from '../../config/feature-flags';
@@ -42,7 +47,7 @@ import {
 import { deferred, InboundRoom, roomState, type RoomState } from './inbound-room';
 import { createLogger } from '../../common/services/logger.service';
 import { EventsGateway } from '../events/events.gateway';
-import { WebhookService } from '../webhook/webhook.service';
+import { type PreparedWebhookDelivery, WebhookService } from '../webhook/webhook.service';
 import { HookManager } from '../../core/hooks';
 import {
   deliveryStatusToMessageStatus,
@@ -79,20 +84,63 @@ export const ACK_RECONCILE_DELAY_MS = 750;
  */
 export const PERSIST_RETRY_DELAY_MS = 300;
 
+/**
+ * The most often one engine stamps its session's `lastActiveAt`. Its readers (the session response, the dashboard,
+ * the data export) need nothing near per-message precision, so a write per message cost a row version per message
+ * on the one session row for nothing. `lastActive` can therefore lag the latest message by up to this long.
+ */
+export const LAST_ACTIVE_WRITE_WINDOW_MS = 30_000;
+
 /** How many of its messages marked edited a session remembers as marked (see markedEdited). */
 const EDITED_MARKS_KEPT_PER_SESSION = 500;
 
 /**
- * How a message insert ended: `yes` the row landed, `dup` a unique violation (`retried` says whether
- * it came from the retry, when the first attempt may have committed before its error), `failed` a
- * non-conflict error, `stale` the engine was retired while the retry waited.
+ * Value snapshot of the in-flight mutation fields that affect `withChangesMadeInFlight()`.
+ * Used to detect post-prepare edits or revokes without relying on object reference identity.
  */
-type InsertOutcome = { landed: 'yes' | 'failed' | 'stale' } | { landed: 'dup'; retried: boolean };
+interface InFlightMutationSnapshot {
+  revoked: boolean;
+  revokeAnnounced: boolean;
+  editedBody: string | undefined;
+  edited: boolean;
+  rowMarked: boolean;
+}
+
+const snapshotInFlight = (entry: InFlightEntry, rowMarked = false): InFlightMutationSnapshot => ({
+  revoked: entry?.revoked === true,
+  revokeAnnounced: entry?.revokeAnnounced === true,
+  editedBody: entry?.editedBody,
+  edited: entry?.edited === true,
+  rowMarked,
+});
+
+const sameInFlightSnapshot = (a: InFlightMutationSnapshot, b: InFlightMutationSnapshot): boolean =>
+  a.revoked === b.revoked &&
+  a.revokeAnnounced === b.revokeAnnounced &&
+  a.editedBody === b.editedBody &&
+  a.edited === b.edited &&
+  a.rowMarked === b.rowMarked;
+
+/**
+ * How a message insert ended: `yes` the row landed (with `openedDeliveries` holding the subset of
+ * prepared outbox rows newly inserted in the transaction), `dup` a unique violation (`retried` says
+ * whether it came from the retry, when the first attempt may have committed before its error),
+ * `failed` a non-conflict error, `stale` the engine was retired while the retry waited.
+ */
+type InsertOutcome =
+  | { landed: 'yes'; openedDeliveries?: PreparedWebhookDelivery[] }
+  | { landed: 'failed' | 'stale' }
+  | { landed: 'dup'; retried: boolean };
 
 /** Persist-stage outcome threaded into the inbound dispatch stage (was closure state in the hook continuation). */
 interface InboundPersistOutcome {
   dbMessage: Message;
   persisted: boolean;
+  prepared?: PreparedWebhookDelivery[];
+  openedDeliveries?: PreparedWebhookDelivery[];
+  preparedCommitted?: boolean;
+  preparedSnapshot?: InFlightMutationSnapshot;
+  retriedDup?: boolean;
 }
 
 /**
@@ -107,9 +155,23 @@ const quoteOf = (m: Pick<IncomingMessage, 'chatId' | 'body'>) => ({ chatId: m.ch
 
 /** A deleted message as hooks and consumers see it: nothing of its content survives, as in REVOKED_ROW_PATCH. */
 const deletedPlaceholder = (message: InboundMessageData): InboundMessageData => {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { media, quotedMessage, call, buttons, button, location, order, product, poll, mentionedIds, ...kept } =
-    message;
+  /* eslint-disable @typescript-eslint/no-unused-vars */
+  const {
+    media,
+    quotedMessage,
+    call,
+    buttons,
+    button,
+    location,
+    order,
+    product,
+    poll,
+    mentionedIds,
+    isForwarded,
+    forwardingScore,
+    ...kept
+  } = message;
+  /* eslint-enable @typescript-eslint/no-unused-vars */
   return { ...kept, body: '', type: 'revoked' };
 };
 
@@ -118,6 +180,31 @@ const refOf = (m: Pick<IncomingMessage, 'chatId' | 'fromMe' | 'author'>): Stored
   chatId: m.chatId,
   direction: m.fromMe ? MessageDirection.OUTGOING : MessageDirection.INCOMING,
   author: m.author,
+});
+
+/** Extract a StoredMessageRef from a pending webhook outbox payload, or null when fields are missing. */
+const outboxPayloadToRef = (payload: Record<string, unknown>): StoredMessageRef | null => {
+  const chatId = typeof payload.chatId === 'string' && payload.chatId.length > 0 ? payload.chatId : null;
+  if (!chatId || typeof payload.fromMe !== 'boolean') return null;
+  const author =
+    typeof payload.author === 'string' && payload.author.length > 0
+      ? payload.author
+      : typeof payload.sender === 'string' && payload.sender.length > 0
+        ? payload.sender
+        : undefined;
+  return {
+    chatId,
+    direction: payload.fromMe ? MessageDirection.OUTGOING : MessageDirection.INCOMING,
+    author,
+  };
+};
+
+/** Build a self-consistent revoke MutationSource from a message's StoredMessageRef. */
+const revokeSourceFor = (ref: StoredMessageRef): MutationSource => ({
+  kind: 'revoke',
+  chatId: ref.chatId,
+  fromMe: ref.direction === MessageDirection.OUTGOING,
+  author: ref.author ?? undefined,
 });
 
 /** What a delivery claims to be, as the rule that refuses a change aimed at a stored row reads it. */
@@ -149,7 +236,9 @@ interface InFlightEntry {
   // An edit held for the message or applied by the engine changed its text, or was asked for: the row it lands on is
   // marked edited.
   edited?: boolean;
-  ackStatus?: MessageStatus;
+  // The furthest ack kept for the row per chat its receipt named ('' when it named none), so one naming another chat
+  // cannot displace one naming this message's: the insert advances the row by those its chat proves to be the row's.
+  acks?: Map<string, MessageStatus>;
   // Latest reaction per sender; '' means the sender withdrew theirs.
   reactions?: Record<string, string>;
   // Deliveries sharing the entry: a repeat keeps what was recorded for the first one.
@@ -284,6 +373,10 @@ export class MessageProjector {
   // EDITED_MARKS_KEPT_PER_SESSION the oldest is forgotten, and a repeat of it goes out unmarked.
   private readonly markedEdited = new Map<string, Set<string>>();
 
+  // When each engine last stamped its session's lastActiveAt. By engine, not session, so a replacement engine stamps
+  // with its first message and an entry goes with its engine.
+  private readonly lastActiveStamped = new WeakMap<IWhatsAppEngine, number>();
+
   // Reaction/edit applies, extracted to a plain collaborator. It shares this instance's
   // messageMutations queue, so the public enqueue path and the queued applies serialize on one chain.
   private readonly mutationProjector: MessageMutationProjector;
@@ -309,6 +402,7 @@ export class MessageProjector {
     @Optional()
     private readonly automationRules?: AutomationRulesService,
     @Optional() private readonly lidMappingStore?: LidMappingStoreService,
+    @Optional() private readonly ownership?: SessionOwnershipService,
   ) {
     this.mutationProjector = new MessageMutationProjector(
       this.messageRepository,
@@ -318,11 +412,32 @@ export class MessageProjector {
       this.logger,
       (sessionId, waMessageId) => this.noteMarkedEdited(sessionId, waMessageId),
       this.lidMappingStore ? jid => this.lidMappingStore!.findPhoneForLid(jid) : undefined,
+      (sessionId, waMessageId) => this.announceChangedRow(sessionId, waMessageId),
     );
     this.engines.onRetire((id, engine) => {
       for (const t of this.tickets.get(id) ?? []) if (t.engine === engine) t.drop();
       this.deleteRoomIfIdle(id);
       if (!this.engines.has(id)) this.markedEdited.delete(id);
+    });
+  }
+
+  /** Drop per-session in-memory state held by collaborators when a session row is removed. */
+  forgetSession(sessionId: string): void {
+    this.automationRules?.forgetSession(sessionId);
+  }
+
+  /** Stamp the session's last-active time, at most once per {@link LAST_ACTIVE_WRITE_WINDOW_MS} for this engine. */
+  private touchLastActive(id: string, engine: IWhatsAppEngine): void {
+    const now = Date.now();
+    const stamped = this.lastActiveStamped.get(engine);
+    // A clock set back re-arms the stamp instead of silencing it until the old time comes round again.
+    if (stamped !== undefined && now >= stamped && now - stamped < LAST_ACTIVE_WRITE_WINDOW_MS) return;
+    this.lastActiveStamped.set(engine, now);
+    // A write that fails leaves the next message to try again, not the rest of the window without a stamp.
+    // Fence on nodeId when cluster ownership is active so a lapsed-lease replica never updates a peer's row.
+    const nodeId = this.ownership?.nodeId;
+    void this.sessionRepository.update(nodeId ? { id, nodeId } : id, { lastActiveAt: new Date(now) }).catch(() => {
+      if (this.lastActiveStamped.get(engine) === now) this.lastActiveStamped.delete(engine);
     });
   }
 
@@ -480,8 +595,7 @@ export class MessageProjector {
       from: message.from,
       action: 'message_received',
     });
-    // Update last active timestamp
-    void this.sessionRepository.update(id, { lastActiveAt: new Date() }).catch(() => undefined);
+    this.touchLastActive(id, engine);
     // Convert IncomingMessage to plain object for dispatch. One delivered deleted reaches the hooks with no content,
     // whatever text the engine handed over with it.
     const messageData = message.type === 'revoked' ? deletedPlaceholder(message) : { ...message };
@@ -632,6 +746,9 @@ export class MessageProjector {
 
   /** Record a message as not yet written; a re-fire of the same id keeps the changes recorded so far. */
   private trackInFlight(key: string, message: InboundMessageData): InFlightEntry {
+    // A message whose id the engine could not read is registered under no key: the empty id would be shared by
+    // every such message, and a revoke or ack that names no message would reach all of them.
+    if (!message.id) return { ref: refOf(message) };
     const inFlight = this.inboundInFlight.get(key) ?? {
       // The first delivery of an id says whose message it is: a repeat sent from another chat must not
       // take that over from it, or a change aimed through the repeat would be judged by the wrong rule.
@@ -749,7 +866,9 @@ export class MessageProjector {
           // The ingest awaited; a stop()/delete() can retire this engine mid-flight — don't
           // dispatch for a session that no longer exists (mirrors message.received's re-check).
           if (!this.engines.isLive(id, engine)) return;
-          if (created) this.dispatchStatusReceived(id, row);
+          // One that expired while the ingest ran (a slow media write) is gone from every read: announcing it
+          // would point a consumer at a status the API no longer serves.
+          if (created && row.expiresAt > Date.now()) this.dispatchStatusReceived(id, row);
         })
         .catch(err =>
           this.logger.warn('Status ingest failed', {
@@ -757,6 +876,22 @@ export class MessageProjector {
             error: err instanceof Error ? err.message : String(err),
           }),
         )
+    );
+  }
+
+  /**
+   * Drop a story its poster deleted from the status store, with its media. An engine that passes an actor does not
+   * vouch for who sent the delete (Baileys), so the store holds the sender to the poster of the story, and removes
+   * nothing when the sender is unknown. One that passes none (whatsapp-web.js) reports a delete only after WhatsApp
+   * Web accepted it.
+   */
+  private removeDeletedStory(id: string, statusId: string, actor?: { participant?: string }): void {
+    void this.statusStore.removeRevoked(id, statusId, actor && { poster: actor.participant }).catch((err: unknown) =>
+      this.logger.warn('Failed to remove a status its poster deleted', {
+        sessionId: id,
+        statusId,
+        error: err instanceof Error ? err.message : String(err),
+      }),
     );
   }
 
@@ -820,7 +955,7 @@ export class MessageProjector {
   ): Promise<InboundOutcome | undefined> {
     const outcome = await this.persistInboundMessage(id, engine, finalMessage, entry);
     if (outcome === 'repeat') return this.judgeRepeat(id, finalMessage);
-    if (outcome) this.dispatchInboundMessage(id, finalMessage, outcome, entry);
+    if (outcome) await this.dispatchInboundMessage(id, finalMessage, outcome, entry);
     return undefined;
   }
 
@@ -887,18 +1022,55 @@ export class MessageProjector {
     // session that no longer exists. Mirrors the synchronous isLiveEngine gate at entry.
     await this.waitForInFlightChanges(id, incoming.id);
     if (!this.engines.isLive(id, engine)) return null;
-    const insertedCleared = this.applyHeldChanges(dbMessage, entry);
+    let insertedCleared = this.applyHeldChanges(dbMessage, entry);
+
+    let prepared: PreparedWebhookDelivery[] | undefined;
+    let preparedSnapshot: InFlightMutationSnapshot | undefined;
+    if (this.canTransactWithOutbox()) {
+      const prep = await this.prepareTransactionalDeliveries(
+        id,
+        engine,
+        'message.received',
+        incoming,
+        entry,
+        dbMessage,
+        insertedCleared,
+      );
+      if (prep.stale) return null;
+      if (prep.failed) {
+        // Webhook lookup failed: do not commit `messages` with 0 outbox rows (which would turn a
+        // later retry into 'repeat' and lose the webhook). Fail open for live dispatch instead.
+        return { dbMessage, persisted: false };
+      }
+      prepared = prep.prepared;
+      preparedSnapshot = prep.snapshot;
+      insertedCleared = prep.insertedCleared;
+    }
 
     // De-duplicate at the source: the engine can re-fire `message` for one inbound message
-    // (#464). UNIQUE(sessionId, waMessageId) makes the insert the atomic dedup oracle — a
+    // (#464). UNIQUE(sessionId, waMessageId) makes the insert the atomic dedup oracle: a
     // near-simultaneous re-fire loses the race and is skipped here, so persist + webhook + WS
-    // happen exactly once. Fail-open: a non-conflict DB error still dispatches, so a real
-    // message is never dropped by a transient DB failure.
-    const outcome = await this.insertWithRetry(id, engine, dbMessage, 'incoming');
+    // happen exactly once. When a transactional DataSource and webhook outbox are wired, the
+    // message row and its pending outbox rows commit in one database transaction. Fail-open: a
+    // non-conflict DB error still dispatches, so a real message is never dropped by a DB fault.
+    const outcome = await this.insertWithRetry(id, engine, dbMessage, 'incoming', prepared);
     await this.waitForInFlightChanges(id, incoming.id);
-    if (!this.engines.isLive(id, engine)) return null;
+    if (!this.engines.isLive(id, engine)) {
+      await this.settleRevokedOutboxOnRetire(id, 'message.received', incoming, entry, outcome);
+      return null;
+    }
     if (outcome.landed === 'yes') {
       this.applyChangesMadeInFlight(id, incoming.id, entry, insertedCleared);
+      if (prepared !== undefined) {
+        return {
+          dbMessage,
+          persisted: true,
+          prepared,
+          openedDeliveries: outcome.openedDeliveries ?? [],
+          preparedCommitted: true,
+          preparedSnapshot,
+        };
+      }
       return { dbMessage, persisted: true };
     }
     if (outcome.landed === 'stale') return null;
@@ -914,7 +1086,220 @@ export class MessageProjector {
       void this.recordRevoke(id, incoming.id, claimOf(incoming));
     }
     if (outcome.landed === 'dup' && !outcome.retried) return 'repeat';
-    return { dbMessage, persisted: false };
+    const retriedDup = outcome.landed === 'dup' && outcome.retried;
+    return {
+      dbMessage,
+      persisted: false,
+      ...(retriedDup ? { prepared, preparedSnapshot } : {}),
+      retriedDup,
+    };
+  }
+
+  /**
+   * If an engine retires right after a transactional commit while a revoke already landed for this
+   * message, close (engine revoke) or redact (REST revoke) any committed pending outbox rows so the
+   * reconciler cannot replay unredacted revoked content after teardown.
+   */
+  private async settleRevokedOutboxOnRetire(
+    id: string,
+    event: 'message.received' | 'message.sent',
+    message: InboundMessageData,
+    entry: InFlightEntry,
+    outcome: InsertOutcome,
+  ): Promise<void> {
+    if (outcome.landed === 'yes' && outcome.openedDeliveries?.length) {
+      if (entry?.revokeAnnounced) {
+        await this.webhookService.cancelPreparedDeliveries?.(outcome.openedDeliveries);
+      } else if (entry?.revoked) {
+        await this.webhookService.reconcilePreparedDeliveries?.(
+          outcome.openedDeliveries,
+          id,
+          event,
+          deletedPlaceholder(message),
+          outcome.openedDeliveries,
+        );
+      }
+      return;
+    }
+    if (outcome.landed === 'dup' && outcome.retried) {
+      const predicate = this.outboxPredicateFor(revokeSourceFor(refOf(message)));
+      if (entry?.revokeAnnounced) {
+        await this.webhookService.closePendingDeliveriesForMessage?.(id, message.id, predicate);
+      } else if (entry?.revoked) {
+        await this.webhookService.redactPendingDeliveriesForMessage?.(id, message.id, predicate);
+      }
+    }
+  }
+
+  /**
+   * Build a payload ownership predicate for pending webhook outbox rows matching `source`, using
+   * the same foreign-row rule applied to stored `messages` rows.
+   */
+  private outboxPredicateFor(
+    source: MutationSource,
+    allowUnverifiedFallback = false,
+  ): (payload: Record<string, unknown>) => Promise<boolean> {
+    const resolveLid = this.lidMappingStore ? (jid: string) => this.lidMappingStore!.findPhoneForLid(jid) : undefined;
+    return async (payload: Record<string, unknown>): Promise<boolean> => {
+      const ref = outboxPayloadToRef(payload);
+      if (!ref) return allowUnverifiedFallback;
+      return (await mutationTargetsForeignRowPersisted(ref, source, resolveLid)) === null;
+    };
+  }
+
+  /**
+   * True when both a transaction-capable DataSource and the composable webhook outbox methods are
+   * present (always true in production; false only in unit tests that stub repositories/webhooks).
+   */
+  private canTransactWithOutbox(): boolean {
+    const connection = this.messageRepository.manager?.connection;
+    return (
+      typeof connection?.transaction === 'function' &&
+      typeof this.webhookService.prepareDeliveries === 'function' &&
+      typeof this.webhookService.openPreparedDeliveries === 'function' &&
+      typeof this.webhookService.reconcilePreparedDeliveries === 'function' &&
+      typeof this.webhookService.dispatchPreparedDeliveries === 'function'
+    );
+  }
+
+  /**
+   * Read-only pre-transaction preparation for transactional message + webhook outbox commits.
+   * Runs strictly before opening any DB transaction so zero non-DB awaits (LID lookups, webhook
+   * reads, filter evaluation) occur while holding a transaction or SQLite's shared connection.
+   *
+   * Propagates lookup errors (`throwOnLookupError: true`) with one transient retry instead of
+   * silently degrading to 0 webhooks, so a DB fault never commits `messages` with 0 outbox rows.
+   * Tracks in-flight mutation state by value so pre-edited messages are prepared only once.
+   */
+  private async prepareTransactionalDeliveries(
+    id: string,
+    engine: IWhatsAppEngine,
+    event: 'message.received' | 'message.sent',
+    message: InboundMessageData,
+    entry: InFlightEntry,
+    dbMessage: Message,
+    insertedCleared: boolean,
+  ): Promise<{
+    prepared: PreparedWebhookDelivery[];
+    snapshot: InFlightMutationSnapshot;
+    insertedCleared: boolean;
+    stale: boolean;
+    failed: boolean;
+  }> {
+    const prepareStrict = async (
+      payload: Record<string, unknown>,
+    ): Promise<{ deliveries: PreparedWebhookDelivery[]; stale: boolean; failed: boolean }> => {
+      const label = `Failed to load webhooks before persisting ${event} for message ${message.id}`;
+      try {
+        const deliveries = await this.webhookService.prepareDeliveries(id, event, payload, {
+          throwOnLookupError: true,
+        });
+        return { deliveries, stale: false, failed: false };
+      } catch (err) {
+        if (!isTransientDbError(err)) {
+          this.logger.error(label, String(err));
+          return { deliveries: [], stale: false, failed: true };
+        }
+        this.logger.warn(`${label}, retrying once`, { sessionId: id, error: String(err) });
+      }
+      await new Promise(resolve => setTimeout(resolve, PERSIST_RETRY_DELAY_MS));
+      if (!this.engines.isLive(id, engine)) {
+        return { deliveries: [], stale: true, failed: false };
+      }
+      try {
+        const deliveries = await this.webhookService.prepareDeliveries(id, event, payload, {
+          throwOnLookupError: true,
+        });
+        return { deliveries, stale: false, failed: false };
+      } catch (err) {
+        this.logger.error(label, String(err));
+        return { deliveries: [], stale: false, failed: true };
+      }
+    };
+
+    const snapBefore = snapshotInFlight(entry);
+    const preAnnounced = this.withChangesMadeInFlight(message, entry);
+    if (!preAnnounced) {
+      return { prepared: [], snapshot: snapBefore, insertedCleared, stale: false, failed: false };
+    }
+    const first = await prepareStrict(preAnnounced);
+    if (first.stale || first.failed) {
+      return { prepared: [], snapshot: snapBefore, insertedCleared, stale: first.stale, failed: first.failed };
+    }
+    let prepared = first.deliveries;
+    let snapshot = snapBefore;
+
+    await this.waitForInFlightChanges(id, message.id);
+    if (!this.engines.isLive(id, engine)) {
+      return { prepared: [], snapshot, insertedCleared, stale: true, failed: false };
+    }
+    insertedCleared = this.applyHeldChanges(dbMessage, entry) || insertedCleared;
+    const snapAfter = snapshotInFlight(entry);
+    if (!sameInFlightSnapshot(snapBefore, snapAfter)) {
+      snapshot = snapAfter;
+      const afterPrepare = this.withChangesMadeInFlight(message, entry);
+      if (!afterPrepare) {
+        return { prepared: [], snapshot, insertedCleared, stale: false, failed: false };
+      }
+      const second = await prepareStrict(afterPrepare);
+      if (second.stale || second.failed) {
+        return { prepared: [], snapshot, insertedCleared, stale: second.stale, failed: second.failed };
+      }
+      prepared = second.deliveries;
+      await this.waitForInFlightChanges(id, message.id);
+      if (!this.engines.isLive(id, engine)) {
+        return { prepared: [], snapshot, insertedCleared, stale: true, failed: false };
+      }
+      insertedCleared = this.applyHeldChanges(dbMessage, entry) || insertedCleared;
+      const finalSnap = snapshotInFlight(entry);
+      if (!this.withChangesMadeInFlight(message, entry)) {
+        return { prepared: [], snapshot: finalSnap, insertedCleared, stale: false, failed: false };
+      }
+    }
+    return { prepared, snapshot, insertedCleared, stale: false, failed: false };
+  }
+
+  /**
+   * Conflict-ignoring insert of one `messages` row inside an active EntityManager. Returns the
+   * committed PK/timestamp metadata if the row was newly inserted, or null if UNIQUE(sessionId,
+   * waMessageId) already existed, without throwing a unique error that would abort a PostgreSQL
+   * transaction or roll back SQLite's shared connection.
+   */
+  private async insertMessageOrIgnore(
+    manager: EntityManager,
+    dbMessage: Message,
+  ): Promise<{ id?: string; createdAt?: Date } | null> {
+    const supportsReturning = manager.connection?.driver?.isReturningSqlSupported?.('insert') === true;
+    if (supportsReturning) {
+      const result = await manager
+        .createQueryBuilder()
+        .insert()
+        .into(Message)
+        .values({ ...dbMessage } as unknown as QueryDeepPartialEntity<Message>)
+        .orIgnore()
+        .returning(['id', 'createdAt'])
+        .updateEntity(false)
+        .execute();
+      const row = Array.isArray(result.raw)
+        ? (result.raw[0] as { id?: string; createdAt?: Date } | undefined)
+        : undefined;
+      return row ?? null;
+    }
+    const candidateId = dbMessage.id ?? randomUUID();
+    await manager
+      .createQueryBuilder()
+      .insert()
+      .into(Message)
+      .values({ ...dbMessage, id: candidateId } as unknown as QueryDeepPartialEntity<Message>)
+      .orIgnore()
+      .updateEntity(false)
+      .execute();
+    const row = await manager.findOne(Message, {
+      where: { id: candidateId },
+      select: { id: true, createdAt: true },
+    });
+    if (!row) return null;
+    return { id: row.id, createdAt: row.createdAt };
   }
 
   /**
@@ -938,9 +1323,12 @@ export class MessageProjector {
   }
 
   /**
-   * Insert a message row under the UNIQUE(sessionId, waMessageId) dedup oracle. `insert()` (not
-   * `save()`) is load-bearing: a duplicate insert throws, which is the atomic dedup oracle for #464
-   * re-fires. A transient failure is retried once after {@link PERSIST_RETRY_DELAY_MS}, re-checking
+   * Insert a message row under the UNIQUE(sessionId, waMessageId) dedup oracle. When `prepared` is
+   * supplied, the conflict-ignoring message insert and prepared webhook outbox rows commit together
+   * inside one database transaction (guarded by `awaitNoOpenTransaction` on SQLite's shared
+   * connection), returning only the newly inserted outbox deliveries so pre-existing keys are never
+   * double-dispatched. Without `prepared` (unit-mocked repositories/services), falls back to a bare
+   * `insert()`. A transient failure is retried once after {@link PERSIST_RETRY_DELAY_MS}, re-checking
    * that the engine is still live so a retired session never gets an orphan row. On success the
    * DB-generated columns are merged onto `dbMessage`.
    */
@@ -949,20 +1337,48 @@ export class MessageProjector {
     engine: IWhatsAppEngine,
     dbMessage: Message,
     direction: 'incoming' | 'outgoing',
+    prepared?: readonly PreparedWebhookDelivery[],
   ): Promise<InsertOutcome> {
     const label = `Failed to save ${direction} message ${dbMessage.waMessageId} to database`;
-    const insert = async (): Promise<InsertOutcome> => {
-      const result = await this.messageRepository.insert(dbMessage as unknown as QueryDeepPartialEntity<Message>);
+    const insert = async (retried: boolean): Promise<InsertOutcome> => {
+      // Registered with the session's write scope, so a delete drains an insert already under way before it
+      // removes the session's rows; the row has no foreign key to refuse one that lands afterwards.
+      const connection = this.messageRepository.manager?.connection;
+      const writes = captureSessionWrites(connection ?? this.messageRepository, id);
+      if (prepared !== undefined && connection) {
+        let insertedMeta: { id?: string; createdAt?: Date } | null = null;
+        let openedDeliveries: PreparedWebhookDelivery[] = [];
+        await writes
+          .write(async () => {
+            if (!(await awaitNoOpenTransaction(connection))) {
+              throw new Error('Timed out waiting for the message database transaction');
+            }
+            if (prepared.length > 0) {
+              await connection.transaction(async manager => {
+                insertedMeta = await this.insertMessageOrIgnore(manager, dbMessage);
+                if (!insertedMeta) return;
+                openedDeliveries = (await this.webhookService.openPreparedDeliveries(prepared, manager)) ?? [];
+              });
+            } else {
+              insertedMeta = await this.insertMessageOrIgnore(this.messageRepository.manager, dbMessage);
+            }
+          })
+          .finally(() => writes.close());
+        if (!insertedMeta) return { landed: 'dup', retried };
+        Object.assign(dbMessage, insertedMeta);
+        return { landed: 'yes', openedDeliveries };
+      }
+      const result = await writes
+        .write(() => this.messageRepository.insert(dbMessage as unknown as QueryDeepPartialEntity<Message>))
+        .finally(() => writes.close());
       // `insert()` (not `save()`) does NOT merge DB-generated columns (@PrimaryGeneratedColumn,
-      // @CreateDateColumn) back onto the entity instance — so merge them explicitly here, before
-      // the `message:persisted` emit. `identifiers[0]` always carries the PK on both SQLite and
-      // Postgres; `generatedMaps[0]` adds createdAt where the driver returns it (Postgres yes;
-      // SQLite historically does not — acceptable; the PK is the load-bearing field for plugins).
+      // @CreateDateColumn) back onto the entity instance, so merge them explicitly here before
+      // the `message:persisted` emit.
       Object.assign(dbMessage, result.identifiers[0] ?? {}, result.generatedMaps?.[0] ?? {});
       return { landed: 'yes' };
     };
     try {
-      return await insert();
+      return await insert(false);
     } catch (err) {
       if (isUniqueViolation(err)) return { landed: 'dup', retried: false };
       if (!isTransientDbError(err)) {
@@ -974,7 +1390,7 @@ export class MessageProjector {
     await new Promise(resolve => setTimeout(resolve, PERSIST_RETRY_DELAY_MS));
     if (!this.engines.isLive(id, engine)) return { landed: 'stale' };
     try {
-      return await insert();
+      return await insert(true);
     } catch (err) {
       if (isUniqueViolation(err)) return { landed: 'dup', retried: true };
       this.logger.error(label, String(err));
@@ -1007,16 +1423,16 @@ export class MessageProjector {
     insertedCleared = false,
     lostInsert?: MutationSource,
   ): void {
-    const { ackStatus } = pending;
+    const { acks } = pending;
     const rowChanges = Boolean(
       pending.revoked || pending.editedBody !== undefined || pending.edited || pending.reactions,
     );
-    if (!ackStatus && !rowChanges) return;
+    if (!acks?.size && !rowChanges) return;
     const advance = (): void => {
-      if (!ackStatus) return;
-      void this.advanceAck(id, waMessageId, ackStatus).catch(err =>
-        this.logger.error(`Failed to advance ack for ${waMessageId}`, String(err)),
-      );
+      if (!acks?.size) return;
+      void this.furthestParkedAck(pending.ref, acks)
+        .then(status => (status ? this.advanceAck(id, waMessageId, status) : 0))
+        .catch(err => this.logger.error(`Failed to advance ack for ${waMessageId}`, String(err)));
     };
     if (!lostInsert) {
       advance();
@@ -1042,6 +1458,24 @@ export class MessageProjector {
     });
   }
 
+  /**
+   * The furthest of the acks kept for a message in flight whose receipt named its chat, or no chat: one naming another
+   * chat (through the lid directory, as {@link receiptVerdict} judges a written row) is left out. The queued receipt
+   * judgement already logged it.
+   */
+  private async furthestParkedAck(
+    ref: StoredMessageRef | undefined,
+    acks: Map<string, MessageStatus>,
+  ): Promise<MessageStatus | undefined> {
+    const resolveLid = this.lidMappingStore ? (jid: string) => this.lidMappingStore!.findPhoneForLid(jid) : undefined;
+    let furthest: MessageStatus | undefined;
+    for (const [chat, status] of acks) {
+      if (chat && ref && (await receiptTargetsForeignRowPersisted(ref, chat, resolveLid))) continue;
+      if (!furthest || ackStatusTransitionFrom(status).includes(furthest)) furthest = status;
+    }
+    return furthest;
+  }
+
   /** The row part of {@link applyChangesMadeInFlight}. Must run on the mutation chain. */
   private async writeChangesMadeInFlight(
     id: string,
@@ -1049,20 +1483,101 @@ export class MessageProjector {
     pending: InFlightEntry,
     insertedCleared: boolean,
   ): Promise<void> {
-    if (pending.revoked) return this.revokeRow(id, waMessageId, !insertedCleared);
+    if (pending.revoked) {
+      return this.revokeRow(
+        id,
+        waMessageId,
+        !insertedCleared,
+        pending.ref ? revokeSourceFor(pending.ref) : undefined,
+        pending.revokeAnnounced === true,
+      );
+    }
     try {
       // Never onto a revoked row, as the edit paths: a message delivered deleted, or deleted before it, stays cleared.
+      // Compared in the write: a row inserted with the edit already applied is not changed again here.
+      let textChanged = false;
       if (pending.editedBody !== undefined) {
-        await this.messageRepository.update(
-          { sessionId: id, waMessageId, type: Not('revoked') },
+        const result = await this.messageRepository.update(
+          { sessionId: id, waMessageId, type: Not('revoked'), body: Or(Not(pending.editedBody), IsNull()) },
           { body: pending.editedBody },
         );
+        textChanged = Boolean(result?.affected);
       }
       if (pending.reactions) await this.storeReactions(id, waMessageId, pending.reactions);
       // The marker an edit of a stored row leaves, written last so a lost metadata race costs it alone.
       if (pending.edited) await this.mutationProjector.markMessageEdited(id, waMessageId);
+      if (textChanged) await this.announceChangedRow(id, waMessageId);
     } catch (err) {
       this.logger.error(`Failed to apply changes to message ${waMessageId}`, String(err));
+    }
+  }
+
+  /**
+   * A forward of a message the gateway holds no row for stores a placeholder of type 'forward', the only writer of
+   * that type, because the send path has nothing but the engine id to go on. When that row takes the id first, the
+   * own-send echo, which carries the forwarded type, caption and media marker, loses its insert and lands here: its
+   * content replaces the placeholder and the row is announced again. Status is left alone, an ack may have advanced
+   * it, and so is an edit that reached the message while its insert was running. Must run on the message's mutation
+   * chain. Never rejects.
+   */
+  private async replaceForwardPlaceholder(
+    id: string,
+    echoRow: Message,
+    source: MutationSource,
+    entry: InFlightEntry,
+  ): Promise<void> {
+    const { waMessageId, type, metadata } = echoRow;
+    const body = entry.editedBody ?? echoRow.body;
+    if (!waMessageId || type === 'revoked') return;
+    try {
+      const placeholder = await this.messageRepository.findOne({
+        where: { sessionId: id, waMessageId, type: 'forward' },
+        select: { id: true },
+      });
+      if (!placeholder) return;
+      const reason = await this.mutationProjector.foreignRowReason(id, waMessageId, source);
+      if (reason) {
+        this.logger.warn('Not replacing the forward placeholder with a message that is not the one it holds', {
+          sessionId: id,
+          messageId: waMessageId,
+          reason,
+        });
+        return;
+      }
+      // Before the type flips, so a merge that fails leaves the placeholder as it was, not a typed row without its media.
+      if (metadata) {
+        await updateMessageMetadata(this.messageRepository, { sessionId: id, waMessageId }, current =>
+          mergeSentMetadata(current, metadata),
+        );
+      }
+      const replaced = await this.messageRepository.update(
+        { sessionId: id, waMessageId, type: 'forward' },
+        { type, body },
+      );
+      if (replaced?.affected) await this.announceChangedRow(id, waMessageId);
+    } catch (err) {
+      this.logger.error(`Failed to replace the forward placeholder of ${waMessageId}`, String(err));
+    }
+  }
+
+  /**
+   * Hand a stored row whose text an edit changed to `message:persisted` again, as {@link revokeRow} does for a
+   * cleared one, so a plugin keeping a copy keyed by the row id follows the edit. Re-read, so the payload carries
+   * the edited marker. Never rejects.
+   */
+  private async announceChangedRow(sessionId: string, waMessageId: string): Promise<void> {
+    try {
+      const row = await this.messageRepository.findOne({ where: { sessionId, waMessageId } });
+      if (!row) return;
+      void this.hookManager
+        .execute('message:persisted', { sessionId, message: row }, { sessionId, source: 'SessionService' })
+        .catch(() => undefined);
+    } catch (err) {
+      this.logger.warn('Failed to read an edited message for message:persisted', {
+        sessionId,
+        messageId: waMessageId,
+        error: String(err),
+      });
     }
   }
 
@@ -1097,7 +1612,7 @@ export class MessageProjector {
       }
       stored = new Promise(resolve =>
         this.enqueueMessageMutation(sessionId, waMessageId, () =>
-          this.revokeRow(sessionId, waMessageId, true, source).finally(resolve),
+          this.revokeRow(sessionId, waMessageId, true, source, announced).finally(resolve),
         ),
       );
     });
@@ -1121,6 +1636,7 @@ export class MessageProjector {
     waMessageId: string,
     notify = true,
     source?: MutationSource,
+    announced = false,
   ): Promise<void> {
     // An undefined condition is DROPPED from the where-clause, which would clear every row of the session.
     if (!waMessageId) return;
@@ -1136,6 +1652,19 @@ export class MessageProjector {
       }
       const result = await this.messageRepository.update({ sessionId, waMessageId }, REVOKED_ROW_PATCH);
       this.markedEdited.get(sessionId)?.delete(waMessageId);
+      // Guard any pending outbox rows committed before this revoke arrived (for example, if the
+      // engine retired or crashed before live dispatch): engine revokes suppress replay altogether,
+      // while REST deletes redact the pending payload so deleted content cannot replay.
+      //
+      // When `source` is provided, verify each candidate pending outbox row against its own payload
+      // using the same foreign-row rule so a spoofed cross-chat revoke (especially when no stored
+      // `messages` row existed to check) cannot close or redact another chat's pending outbox row.
+      const outboxPredicate = source ? this.outboxPredicateFor(source, Boolean(result?.affected)) : undefined;
+      if (announced) {
+        await this.webhookService.closePendingDeliveriesForMessage?.(sessionId, waMessageId, outboxPredicate);
+      } else {
+        await this.webhookService.redactPendingDeliveriesForMessage?.(sessionId, waMessageId, outboxPredicate);
+      }
       if (!result?.affected || !notify) return;
       const row = await this.messageRepository.findOne({ where: { sessionId, waMessageId } });
       if (!row) return;
@@ -1148,13 +1677,14 @@ export class MessageProjector {
   }
 
   /** Fan an accepted inbound message out: `message:persisted` plugin hook, webhook, websocket emit. */
-  private dispatchInboundMessage(
+  private async dispatchInboundMessage(
     id: string,
     finalMessage: InboundMessageData,
     outcome: InboundPersistOutcome,
     entry: InFlightEntry,
-  ): void {
-    const { dbMessage, persisted } = outcome;
+  ): Promise<void> {
+    const { dbMessage, persisted, prepared, openedDeliveries, preparedCommitted, preparedSnapshot, retriedDup } =
+      outcome;
     // Fire-and-forget: a plugin handler must never break the receive path. Both engine adapters
     // (wwjs `message` and Baileys `upsert`) converge on this persist, so one emit covers inbound.
     // The built-in FTS search provider is DB-synced and does NOT consume this; it exists for
@@ -1162,7 +1692,7 @@ export class MessageProjector {
     // Gate ONLY the hook on `persisted`: on a non-unique insert error (transient SQLITE_BUSY /
     // lock-timeout / connection drop) the row was never stored and `dbMessage.id` is undefined,
     // so emitting `message:persisted` would hand plugins an id-less payload for a row that isn't
-    // in the DB. The webhook/WS dispatch below stays fail-open — a real inbound message must
+    // in the DB. The webhook/WS dispatch below stays fail-open: a real inbound message must
     // never be dropped on a transient DB failure; only the hook requires a durable row.
     if (persisted) {
       void this.hookManager
@@ -1180,9 +1710,52 @@ export class MessageProjector {
     }
 
     const announced = this.withChangesMadeInFlight(finalMessage, entry);
-    if (!announced) return;
-    // Dispatch to webhooks with potentially modified message
-    void this.webhookService.dispatch(id, 'message.received', announced);
+    const currentSnap = snapshotInFlight(entry);
+    if (!announced) {
+      if (preparedCommitted && openedDeliveries?.length) {
+        await this.webhookService.cancelPreparedDeliveries?.(openedDeliveries);
+      } else if (retriedDup) {
+        await this.webhookService.closePendingDeliveriesForMessage?.(
+          id,
+          finalMessage.id,
+          this.outboxPredicateFor(revokeSourceFor(refOf(finalMessage))),
+        );
+      }
+      return;
+    }
+    // Dispatch to webhooks with potentially modified message (fire-and-forget so HTTP/retries never
+    // stall the per-chat commit queue).
+    if (preparedCommitted) {
+      if (preparedSnapshot && sameInFlightSnapshot(preparedSnapshot, currentSnap)) {
+        if (prepared && prepared.length > 0) void this.webhookService.dispatchPreparedDeliveries(prepared);
+      } else {
+        const reconciled = await this.webhookService.reconcilePreparedDeliveries(
+          prepared ?? [],
+          id,
+          'message.received',
+          announced,
+          openedDeliveries,
+        );
+        if (reconciled.length > 0) void this.webhookService.dispatchPreparedDeliveries(reconciled);
+      }
+    } else if (retriedDup && prepared !== undefined) {
+      if (preparedSnapshot && sameInFlightSnapshot(preparedSnapshot, currentSnap)) {
+        if (prepared.length > 0) {
+          await this.webhookService.openPreparedDeliveries(prepared);
+          void this.webhookService.dispatchPreparedDeliveries(prepared);
+        }
+      } else {
+        const reconciled = await this.webhookService.reconcilePreparedDeliveries(
+          prepared,
+          id,
+          'message.received',
+          announced,
+        );
+        if (reconciled.length > 0) void this.webhookService.dispatchPreparedDeliveries(reconciled);
+      }
+    } else {
+      void this.webhookService.dispatch(id, 'message.received', announced);
+    }
     // Autoreply rules ride the same at-most-once dispatch (the insert oracle above dedupes engine
     // re-fires) and stay fail-open like the webhook: a broken rule must never break the receive path.
     void this.automationRules?.evaluateInbound(id, announced).catch(() => undefined);
@@ -1247,8 +1820,7 @@ export class MessageProjector {
       to: message.to,
       action: 'message_sent',
     });
-    // Update last active timestamp
-    void this.sessionRepository.update(id, { lastActiveAt: new Date() }).catch(() => undefined);
+    this.touchLastActive(id, engine);
     // As on the inbound path, one delivered deleted reaches the hooks with no content.
     const messageData = message.type === 'revoked' ? deletedPlaceholder(message) : { ...message };
     delete messageData.originalBody;
@@ -1272,19 +1844,25 @@ export class MessageProjector {
     const quoteOwner = {};
     // Execute hook for message sent - plugins can modify or stop processing. Like the inbound path,
     // the hook chain runs concurrently and the commit waits its turn on the chat's queue.
-    const prepared = this.startHookChain(id, engine, turn, messageData, delivery, quoteOwner, messageData =>
-      this.hookManager
-        .execute('message:sent', messageData, {
-          sessionId: id,
-          source: 'Engine',
-          accept: data => {
-            if (!isMessagePayload(data)) return false;
-            if (delivery.entry.quoteOwner === quoteOwner) delivery.entry.quote = quoteOf(data);
-            return true;
-          },
-        })
-        .then(({ data }) => this.messageOrEngineCopy(id, 'message:sent', data, messageData)),
-    ).catch(onFailure);
+    const prepared = this.startHookChain(id, engine, turn, messageData, delivery, quoteOwner, async messageData => {
+      await this.hookManager?.waitForPendingEchoOriginSends?.(id);
+      if (messageData.id && this.hookManager?.consumeEchoOrigin?.(id, messageData.id)) {
+        this.logger.warn(
+          `Hook re-entrancy blocked: message:sent echo suppressed for ${messageData.id} (session: ${id})`,
+        );
+        return messageData;
+      }
+      const { data } = await this.hookManager.execute('message:sent', messageData, {
+        sessionId: id,
+        source: 'Engine',
+        accept: data => {
+          if (!isMessagePayload(data)) return false;
+          if (delivery.entry.quoteOwner === quoteOwner) delivery.entry.quote = quoteOf(data);
+          return true;
+        },
+      });
+      return this.messageOrEngineCopy(id, 'message:sent', data, messageData);
+    }).catch(onFailure);
     this.commitInTurn(id, message, turn, async () => {
       try {
         const finalMessage = await prepared;
@@ -1329,6 +1907,12 @@ export class MessageProjector {
       !(outgoing.ephemeralDuration && outgoing.ephemeralDuration > 0);
 
     let rowMarked = false;
+    let prepared: PreparedWebhookDelivery[] | undefined;
+    let openedDeliveries: PreparedWebhookDelivery[] | undefined;
+    let preparedSnapshot: InFlightMutationSnapshot | undefined;
+    let preparedCommitted = false;
+    let dupPrepared = false;
+    let retriedDup = false;
     if (mayPersist) {
       const dbMessage = this.messageRepository.create({
         sessionId: id,
@@ -1347,59 +1931,153 @@ export class MessageProjector {
       // awaits. Re-check liveness so a late continuation can't persist an orphan row
       // (mirrors onMessage).
       if (!this.engines.isLive(id, engine)) return;
-      const insertedCleared = this.applyHeldChanges(dbMessage, entry);
-      // A unique violation means the REST send path already persisted this API-originated
-      // send: the dedup oracle working as intended, not an error. Any other failure (after the
-      // one transient retry) fails open, so a real send is never dropped on a DB fault.
-      const outcome = await this.insertWithRetry(id, engine, dbMessage, 'outgoing');
-      await this.waitForInFlightChanges(id, outgoing.id);
-      if (!this.engines.isLive(id, engine)) return;
-      if (outcome.landed === 'stale') return;
-      // The REST writer may have won either attempt; its row still takes the echo's pending changes.
-      if (outcome.landed === 'dup') {
-        this.applyChangesMadeInFlight(id, outgoing.id, entry, false, claimOf(outgoing));
-        // A delivery that came deleted clears that row, as a revoke does, once the row proves to be the message.
-        if (outgoing.type === 'revoked') void this.recordRevoke(id, outgoing.id, claimOf(outgoing));
-        // That row may be older than this delivery and edited since, the edit still being written: announced once the
-        // changes queued for the message have run, with the mark they left.
-        rowMarked = await new Promise<boolean>(resolve =>
-          this.enqueueMessageMutation(id, outgoing.id, async () => {
-            const marked = this.markedEdited.get(id)?.has(outgoing.id) === true;
-            const foreign =
-              marked && (await this.mutationProjector.foreignRowReason(id, outgoing.id, claimOf(outgoing)));
-            resolve(marked && !foreign);
-          }),
+      let insertedCleared = this.applyHeldChanges(dbMessage, entry);
+      let skipPersist = false;
+      if (this.canTransactWithOutbox()) {
+        const prep = await this.prepareTransactionalDeliveries(
+          id,
+          engine,
+          'message.sent',
+          outgoing,
+          entry,
+          dbMessage,
+          insertedCleared,
         );
+        if (prep.stale) return;
+        if (prep.failed) {
+          // Webhook lookup failed: do not commit `messages` with 0 outbox rows; fail open below.
+          skipPersist = true;
+        } else {
+          prepared = prep.prepared;
+          preparedSnapshot = prep.snapshot;
+          insertedCleared = prep.insertedCleared;
+        }
       }
-      if (outcome.landed === 'yes') {
-        // The id had no row, so a mark remembered for it was of a row removed since.
-        this.markedEdited.get(id)?.delete(outgoing.id);
-        this.applyChangesMadeInFlight(id, outgoing.id, entry, insertedCleared);
-        // Fire-and-forget, mirroring onMessage: plugin providers (search etc.) see phone-
-        // composed sends exactly like API sends.
-        void this.hookManager
-          .execute(
-            'message:persisted',
-            { sessionId: id, message: dbMessage },
-            { sessionId: id, source: 'SessionService' },
-          )
-          .catch(() => undefined);
+      if (!skipPersist) {
+        // A unique violation means the REST send path already persisted this API-originated
+        // send: the dedup oracle working as intended, not an error. Any other failure (after the
+        // one transient retry) fails open, so a real send is never dropped on a DB fault.
+        const outcome = await this.insertWithRetry(id, engine, dbMessage, 'outgoing', prepared);
+        await this.waitForInFlightChanges(id, outgoing.id);
+        if (!this.engines.isLive(id, engine)) {
+          await this.settleRevokedOutboxOnRetire(id, 'message.sent', outgoing, entry, outcome);
+          return;
+        }
+        if (outcome.landed === 'stale') return;
+        // The REST writer may have won either attempt; its row still takes the echo's pending changes.
+        if (outcome.landed === 'dup') {
+          retriedDup = outcome.retried;
+          dupPrepared = prepared !== undefined;
+          this.applyChangesMadeInFlight(id, outgoing.id, entry, false, claimOf(outgoing));
+          // A delivery that came deleted clears that row, as a revoke does, once the row proves to be the message.
+          if (outgoing.type === 'revoked') void this.recordRevoke(id, outgoing.id, claimOf(outgoing));
+          // That row may be older than this delivery and edited since, the edit still being written: announced once the
+          // changes queued for the message have run, with the mark they left.
+          rowMarked = await new Promise<boolean>(resolve =>
+            this.enqueueMessageMutation(id, outgoing.id, async () => {
+              await this.replaceForwardPlaceholder(id, dbMessage, claimOf(outgoing), entry);
+              const marked = this.markedEdited.get(id)?.has(outgoing.id) === true;
+              const foreign =
+                marked && (await this.mutationProjector.foreignRowReason(id, outgoing.id, claimOf(outgoing)));
+              resolve(marked && !foreign);
+            }),
+          );
+        }
+        if (outcome.landed === 'yes') {
+          if (prepared !== undefined) {
+            openedDeliveries = outcome.openedDeliveries ?? [];
+            preparedCommitted = true;
+          }
+          // The id had no row, so a mark remembered for it was of a row removed since.
+          this.markedEdited.get(id)?.delete(outgoing.id);
+          this.applyChangesMadeInFlight(id, outgoing.id, entry, insertedCleared);
+          // Fire-and-forget, mirroring onMessage: plugin providers (search etc.) see phone-
+          // composed sends exactly like API sends.
+          void this.hookManager
+            .execute(
+              'message:persisted',
+              { sessionId: id, message: dbMessage },
+              { sessionId: id, source: 'SessionService' },
+            )
+            .catch(() => undefined);
 
-        // Archive this send's media, mirroring onMessage. This is the ONLY path a phone-composed
-        // send takes, so the REST-side chokepoint would never see it. Opt-in twice over
-        // (CHAT_MEDIA_ARCHIVE_ENABLED + _OUTBOUND) and a no-op otherwise; archive() itself
-        // refuses a row that is already archived, so the REST writer racing us costs at most one
-        // duplicate file write, which archive() deletes because the first pointer wins.
-        if (this.configService?.get<boolean>('chatMedia.archiveOutbound', false) === true) {
-          void this.chatMediaArchive?.archive(dbMessage).catch(() => undefined);
+          // Archive this send's media, mirroring onMessage. This is the ONLY path a phone-composed
+          // send takes, so the REST-side chokepoint would never see it. Opt-in twice over
+          // (CHAT_MEDIA_ARCHIVE_ENABLED + _OUTBOUND) and a no-op otherwise; archive() itself
+          // refuses a row that is already archived, so the REST writer racing us costs at most one
+          // duplicate file write, which archive() deletes because the first pointer wins.
+          if (this.configService?.get<boolean>('chatMedia.archiveOutbound', false) === true) {
+            void this.chatMediaArchive?.archive(dbMessage).catch(() => undefined);
+          }
         }
       }
     }
 
-    if (!this.engines.isLive(id, engine)) return;
+    if (!this.engines.isLive(id, engine)) {
+      if (preparedCommitted && openedDeliveries?.length) {
+        if (entry?.revokeAnnounced) {
+          await this.webhookService.cancelPreparedDeliveries?.(openedDeliveries);
+        } else if (entry?.revoked) {
+          await this.webhookService.reconcilePreparedDeliveries?.(
+            openedDeliveries,
+            id,
+            'message.sent',
+            deletedPlaceholder(outgoing),
+            openedDeliveries,
+          );
+        }
+      } else if (retriedDup) {
+        const predicate = this.outboxPredicateFor(revokeSourceFor(refOf(finalMessage)));
+        if (entry?.revokeAnnounced) {
+          await this.webhookService.closePendingDeliveriesForMessage?.(id, finalMessage.id, predicate);
+        } else if (entry?.revoked) {
+          await this.webhookService.redactPendingDeliveriesForMessage?.(id, finalMessage.id, predicate);
+        }
+      }
+      return;
+    }
     const sent = this.withChangesMadeInFlight(finalMessage, entry, rowMarked);
-    if (!sent) return;
-    void this.webhookService.dispatch(id, 'message.sent', sent);
+    const currentSnap = snapshotInFlight(entry, rowMarked);
+    if (!sent) {
+      if (preparedCommitted && openedDeliveries?.length) {
+        await this.webhookService.cancelPreparedDeliveries?.(openedDeliveries);
+      } else if (retriedDup) {
+        await this.webhookService.closePendingDeliveriesForMessage?.(
+          id,
+          finalMessage.id,
+          this.outboxPredicateFor(revokeSourceFor(refOf(finalMessage))),
+        );
+      }
+      return;
+    }
+    if (preparedCommitted) {
+      if (preparedSnapshot && sameInFlightSnapshot(preparedSnapshot, currentSnap)) {
+        if (prepared && prepared.length > 0) void this.webhookService.dispatchPreparedDeliveries(prepared);
+      } else {
+        const reconciled = await this.webhookService.reconcilePreparedDeliveries(
+          prepared ?? [],
+          id,
+          'message.sent',
+          sent,
+          openedDeliveries,
+        );
+        if (reconciled.length > 0) void this.webhookService.dispatchPreparedDeliveries(reconciled);
+      }
+    } else if (dupPrepared && prepared !== undefined) {
+      if (preparedSnapshot && sameInFlightSnapshot(preparedSnapshot, currentSnap)) {
+        if (prepared.length > 0) {
+          await this.webhookService.openPreparedDeliveries(prepared);
+          void this.webhookService.dispatchPreparedDeliveries(prepared);
+        }
+      } else if (retriedDup) {
+        const reconciled = await this.webhookService.reconcilePreparedDeliveries(prepared, id, 'message.sent', sent);
+        if (reconciled.length > 0) void this.webhookService.dispatchPreparedDeliveries(reconciled);
+      } else {
+        void this.webhookService.dispatch(id, 'message.sent', sent);
+      }
+    } else {
+      void this.webhookService.dispatch(id, 'message.sent', sent);
+    }
     // Emit real-time event to WebSocket clients (as message.sent, not message.received)
     this.eventsGateway.emitMessageSent(id, sent);
   }
@@ -1426,34 +2104,43 @@ export class MessageProjector {
     // out-of-order/late ack cannot downgrade a higher status, which also makes these
     // fire-and-forget writes race-safe at the DB level.
     const messageStatus = deliveryStatusToMessageStatus(status);
-    if (messageStatus) {
+    const inFlight = this.inboundInFlight.get(`${id}:${messageId}`);
+    // Baileys relays a peer's receipt under the peer's chat with every id it lists, unchecked, so a receipt that
+    // names a chat is held to the message it names before it changes or announces anything. An id that embeds its
+    // chat, as whatsapp-web.js serializes them, cannot name another chat's message.
+    const receiptChat = chatId && !messageId.includes('@') ? chatId : undefined;
+    if (receiptChat && inFlight?.ref && receiptTargetsForeignRow(inFlight.ref, receiptChat)) {
+      this.logForeignReceipt(id, messageId, receiptChat);
+      return;
+    }
+    if (messageStatus && inFlight) {
       // A message not written yet (its commit waits behind an earlier one of the chat) keeps the
-      // furthest ack for when its row lands; the UPDATEs below would match nothing.
-      const inFlight = this.inboundInFlight.get(`${id}:${messageId}`);
-      if (inFlight && (!inFlight.ackStatus || ackStatusTransitionFrom(messageStatus).includes(inFlight.ackStatus))) {
-        inFlight.ackStatus = messageStatus;
-      }
-      const advanceAck = (): Promise<number> => this.advanceAck(id, messageId, messageStatus);
+      // furthest ack per chat for when its row lands; the UPDATEs below would match nothing.
+      const acks = (inFlight.acks ??= new Map<string, MessageStatus>());
+      const chat = receiptChat ?? '';
+      const parked = acks.get(chat);
+      if (!parked || ackStatusTransitionFrom(messageStatus).includes(parked)) acks.set(chat, messageStatus);
+    }
 
-      const logNoop = (): void =>
-        this.logger.debug(`Message ack ${messageId}: no status row advanced to ${messageStatus} (${status})`, {
-          sessionId: id,
-          messageId,
-          status,
-          action: 'message_ack_noop',
-        });
+    const logNoop = (): void =>
+      this.logger.debug(`Message ack ${messageId}: no status row advanced to ${messageStatus} (${status})`, {
+        sessionId: id,
+        messageId,
+        status,
+        action: 'message_ack_noop',
+      });
 
-      const onAckError = (err: unknown): void =>
-        this.logger.error(`Failed to advance ack for ${messageId}`, String(err));
+    const onAckError = (err: unknown): void => this.logger.error(`Failed to advance ack for ${messageId}`, String(err));
 
-      void advanceAck()
+    const advance = (first: () => Promise<number>, retry: () => Promise<number> = first): Promise<void> =>
+      first()
         .then(affected => {
           if (affected > 0) return;
           // affected:0 — most likely the send's 2nd save (which writes waMessageId) hasn't committed
           // yet, so the row isn't matchable. Each ack is one-shot (WhatsApp won't necessarily resend),
           // so retry ONCE after a short delay to close that race rather than leave it stuck at SENT.
           const timer = setTimeout(() => {
-            void advanceAck()
+            void retry()
               .then(retried => {
                 if (retried === 0) logNoop();
               })
@@ -1462,7 +2149,6 @@ export class MessageProjector {
           timer.unref?.();
         })
         .catch(onAckError);
-    }
 
     // One ack payload, emitted identically over the socket and the webhook so a client coded
     // against either channel sees the same shape. `id` mirrors the field every other message.*
@@ -1478,30 +2164,96 @@ export class MessageProjector {
       ...(chatId ? { chatId } : {}),
     };
 
-    // Push the live delivery/read tick to the dashboard over the websocket.
-    this.eventsGateway.emitMessageAck(id, ackPayload);
+    const announce = (): void => {
+      // Push the live delivery/read tick to the dashboard over the websocket.
+      this.eventsGateway.emitMessageAck(id, ackPayload);
 
-    // Dispatch the delivery/read receipt to webhooks (#155). Outgoing `message.sent` is handled
-    // solely by `onMessageCreate`, so the ack path deliberately does NOT emit `message.sent`.
-    void this.webhookService.dispatch(id, 'message.ack', ackPayload);
+      // Dispatch the delivery/read receipt to webhooks (#155). Outgoing `message.sent` is handled
+      // solely by `onMessageCreate`, so the ack path deliberately does NOT emit `message.sent`.
+      void this.webhookService.dispatch(id, 'message.ack', ackPayload);
 
-    // Surface delivery failures actively so consumers don't have to poll for them (#220). Use a
-    // distinct object (not the shared ackPayload) so this separate event can't be perturbed by an
-    // in-place payload mutation in the concurrent message.ack dispatch's webhook:before hook.
-    if (status === 'failed') {
-      void this.webhookService.dispatch(id, 'message.failed', { ...ackPayload });
+      // Surface delivery failures actively so consumers don't have to poll for them (#220). Use a
+      // distinct object (not the shared ackPayload) so this separate event can't be perturbed by an
+      // in-place payload mutation in the concurrent message.ack dispatch's webhook:before hook.
+      if (status === 'failed') {
+        void this.webhookService.dispatch(id, 'message.failed', { ...ackPayload });
+      }
+
+      // Notify plugins of the delivery/read receipt. The `message:ack` hook event was declared in
+      // the HookEvent union but never emitted, so any plugin registered for it silently never fired.
+      // Fire-and-forget: an ack is a notification with nothing downstream to cancel, so the hook's
+      // `continue` flag is moot. Delivery failures surface here as status `failed` — `message:failed`
+      // stays reserved for send-time send failures, which carry a distinct `{ error, input }` payload.
+      void this.hookManager.execute(
+        'message:ack',
+        { messageId, status, ack: deliveryStatusToAck(status) },
+        { sessionId: id, source: 'Engine' },
+      );
+    };
+
+    if (!receiptChat) {
+      if (messageStatus) void advance(() => this.advanceAck(id, messageId, messageStatus));
+      announce();
+      return;
     }
+    this.enqueueMessageMutation(id, messageId, async () => {
+      const verdict = await this.receiptVerdict(id, messageId, receiptChat, inFlight);
+      if (verdict === 'foreign' || !this.engines.isLive(id, engine)) return;
+      announce();
+      if (!messageStatus) return;
+      const target = messageStatus;
+      // A row the verdict did not see is advanced by the retry, which judges it again once it is written, and for a
+      // message still in flight by its insert, with the status parked above, which the insert judges by its chat too.
+      const judged = async (): Promise<number> =>
+        (await this.receiptVerdict(id, messageId, receiptChat, inFlight)) === 'stored'
+          ? this.advanceAck(id, messageId, target)
+          : 0;
+      await advance(
+        verdict === 'stored' ? () => this.advanceAck(id, messageId, target) : () => Promise.resolve(0),
+        judged,
+      );
+    });
+  }
 
-    // Notify plugins of the delivery/read receipt. The `message:ack` hook event was declared in
-    // the HookEvent union but never emitted, so any plugin registered for it silently never fired.
-    // Fire-and-forget: an ack is a notification with nothing downstream to cancel, so the hook's
-    // `continue` flag is moot. Delivery failures surface here as status `failed` — `message:failed`
-    // stays reserved for send-time send failures, which carry a distinct `{ error, input }` payload.
-    void this.hookManager.execute(
-      'message:ack',
-      { messageId, status, ack: deliveryStatusToAck(status) },
-      { sessionId: id, source: 'Engine' },
-    );
+  /**
+   * What the stored row says of a receipt naming `chatId`: absent, the row it may advance, or a row of another chat.
+   * Without a row, a message still in flight (`inFlight`, or the entry held now) is judged by the chat it will be
+   * written under, and is absent unless that proves the receipt foreign.
+   * Never rejects: a row that cannot be read reads as absent, so the receipt goes out and its retry judges again.
+   */
+  private async receiptVerdict(
+    id: string,
+    messageId: string,
+    chatId: string,
+    inFlight?: InFlightEntry,
+  ): Promise<'absent' | 'stored' | 'foreign'> {
+    try {
+      const row = await this.messageRepository.findOne({
+        where: { sessionId: id, waMessageId: messageId },
+        select: { chatId: true, direction: true, author: true },
+      });
+      const ref = row ?? (this.inboundInFlight.get(`${id}:${messageId}`) ?? inFlight)?.ref;
+      if (!ref) return 'absent';
+      const foreign = await receiptTargetsForeignRowPersisted(
+        ref,
+        chatId,
+        this.lidMappingStore ? jid => this.lidMappingStore!.findPhoneForLid(jid) : undefined,
+      );
+      if (!foreign) return row ? 'stored' : 'absent';
+      this.logForeignReceipt(id, messageId, chatId);
+      return 'foreign';
+    } catch {
+      return 'absent';
+    }
+  }
+
+  private logForeignReceipt(id: string, messageId: string, chatId: string): void {
+    this.logger.warn('Dropping a receipt that names a message of another chat', {
+      sessionId: id,
+      messageId,
+      chatId,
+      action: 'message_ack_foreign_chat',
+    });
   }
 
   /**
@@ -1544,7 +2296,7 @@ export class MessageProjector {
     id: string,
     engine: IWhatsAppEngine,
     message: RevokedMessage,
-    actor?: { fromMe: boolean },
+    actor?: { fromMe: boolean; participant?: string; admin?: boolean },
   ): void {
     if (!this.engines.isLive(id, engine)) return;
     this.logger.debug(`Message revoked: ${message.id}`, {
@@ -1561,7 +2313,11 @@ export class MessageProjector {
     // `message.id` is the revocation notification, which never matches a stored row.
     // `revokedId` falls back to `id` (Baileys, where the two are the same).
     const revokedWaMessageId = message.revokedId ?? message.id;
-    const source = actor ? ({ kind: 'revoke', chatId: message.chatId, fromMe: actor.fromMe } as const) : undefined;
+    // A story is not a row of `messages`: the status store drops it, and the rest of the revoke goes on as for any chat.
+    if (message.chatId === 'status@broadcast') this.removeDeletedStory(id, revokedWaMessageId, actor);
+    const source: MutationSource | undefined = actor
+      ? { kind: 'revoke', chatId: message.chatId, fromMe: actor.fromMe, author: actor.participant, admin: actor.admin }
+      : undefined;
     const apply = (): void => {
       void this.recordRevoke(id, revokedWaMessageId, source, true);
 
@@ -1632,6 +2388,10 @@ export class MessageProjector {
   applyMessageEditQueued(id: string, message: EditedMessage): void {
     const source = { kind: 'edit', chatId: message.chatId, fromMe: message.fromMe, author: message.author } as const;
     void this.changeInFlight(id, message.messageId, source, (needsRow, entry) => {
+      // Deleted before its row was written, for everyone or through a REST delete for this account only: the row will
+      // be stored cleared, so the edit is neither held nor announced. Once the row exists, applyMessageEdit refuses a
+      // revoked one itself.
+      if (entry && !needsRow && entry.revoked) return;
       if (entry && !needsRow) this.holdEdit(entry, message.body);
       this.mutationProjector.applyMessageEditQueued(id, message, needsRow);
     });

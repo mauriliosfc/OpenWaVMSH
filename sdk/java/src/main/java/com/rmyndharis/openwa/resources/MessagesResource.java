@@ -15,6 +15,7 @@ import com.rmyndharis.openwa.model.ForwardMessageRequest;
 import com.rmyndharis.openwa.model.ListMessagesQuery;
 import com.rmyndharis.openwa.model.MessageHistoryQuery;
 import com.rmyndharis.openwa.model.MessageListResponse;
+import com.rmyndharis.openwa.model.MessageReceiptsResponse;
 import com.rmyndharis.openwa.model.MessageResponse;
 import com.rmyndharis.openwa.model.PinMessageRequest;
 import com.rmyndharis.openwa.model.ReactMessageRequest;
@@ -201,12 +202,17 @@ public final class MessagesResource {
      * Sends a structured reply proto quoted to the prompt, not a native UI tap.
      */
     public MessageResponse clickButton(String sessionId, ClickButtonRequest body) {
+        return clickButton(sessionId, body, null);
+    }
+
+    public MessageResponse clickButton(String sessionId, ClickButtonRequest body, String idempotencyKey) {
         return client.request(
             HttpMethod.POST,
             "/api/sessions/" + encodeSegment(sessionId) + "/messages/click-button",
             null,
             body,
-            MessageResponse.class);
+            MessageResponse.class,
+            idempotencyKey);
     }
 
     /** Forward a message to another chat. */
@@ -345,6 +351,25 @@ public final class MessagesResource {
             null,
             null,
             ReactionRecord.class);
+    }
+
+    /**
+     * Get who received, read and played a message the account sent. whatsapp-web.js only; Baileys
+     * answers {@code 501}.
+     */
+    public MessageReceiptsResponse receipts(String sessionId, String chatId, String messageId) {
+        return client.request(
+            HttpMethod.GET,
+            "/api/sessions/"
+                + encodeSegment(sessionId)
+                + "/messages/"
+                + encodeSegment(chatId)
+                + "/"
+                + encodeSegment(messageId)
+                + "/receipts",
+            null,
+            null,
+            MessageReceiptsResponse.class);
     }
 
     /**

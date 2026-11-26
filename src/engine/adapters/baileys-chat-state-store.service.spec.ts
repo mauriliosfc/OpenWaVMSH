@@ -748,6 +748,39 @@ describe('ChatStateStoreService', () => {
       expect([...repo.rows.keys()]).toEqual([KEY('s', PHONE)]);
     });
 
+    it('resets the twin rows under a deletion mark, which outlives a restart', async () => {
+      const repo = makeRepo([
+        { sessionId: 's', chatId: LID, pinned: true, observed: 'pinned', updatedAt: new Date(1000) },
+      ]);
+      const svc = svcWith(repo);
+      await svc.fold('s', PHONE, [LID], { muteEndTime: null, archived: false, pinned: false, deletedAt: 5000 });
+      expect([...repo.rows.keys()]).toEqual([KEY('s', PHONE)]);
+      const restarted = svcWith(repo);
+      await restarted.reload();
+      expect(restarted.get('s', PHONE)).toMatchObject({ pinned: false, deletedAt: 5000 });
+    });
+
+    it('keeps the mark of an older twin row that a newer one never saw, on a read and a fold', async () => {
+      const marked = 'muteEndTime,archived,pinned,deletedAt';
+      const repo = makeRepo([
+        { sessionId: 's', chatId: PHONE, pinned: true, observed: 'pinned', updatedAt: new Date(2000) },
+        { sessionId: 's', chatId: LID, deletedAt: 5000, observed: marked, updatedAt: new Date(1000) },
+      ]);
+      const svc = svcWith(repo);
+      await svc.reload();
+      expect(mergeTwinStates([svc.get('s', PHONE)!, svc.get('s', LID)!])).toMatchObject({
+        pinned: true,
+        deletedAt: 5000,
+      });
+      await svc.fold('s', PHONE, [LID], { archived: true });
+      expect([...repo.rows.keys()]).toEqual([KEY('s', PHONE)]);
+      expect(repo.rows.get(KEY('s', PHONE))).toMatchObject({ pinned: true, archived: true, deletedAt: 5000 });
+    });
+
+    it('reads a row written before the mark was kept as having seen no deletion', () => {
+      expect(mergeTwinStates([{ muteEndTime: null, archived: true, pinned: false }])?.observed).toEqual(['archived']);
+    });
+
     it('neither a listing nor a later change brings back the older mute of a cached lid row', async () => {
       const repo = coldNewerPhone();
       const svc = svcWith(repo);
@@ -884,5 +917,48 @@ describe('ChatStateStoreService', () => {
     expect(written).not.toHaveProperty('muteEndTime');
     expect(written).not.toHaveProperty('pinned');
     expect(svc.get('s', 'c')).toBeUndefined();
+  });
+
+  describe('sessionWrites lifecycle cleanup', () => {
+    it('deletes sessionWrites on clearSession without resurrecting via cleared(), and prunes idle entries on reload', async () => {
+      const chatId = '6281234567890@c.us';
+      const repo = makeRepo();
+      const svc = svcWith(repo);
+      const internal = svc as unknown as {
+        sessionWrites: Map<string, { pending: Set<Promise<void>>; seq: number; generation: number }>;
+        cleared: (sessionId: string, generation: number) => boolean;
+      };
+
+      await svc.remember('ephemeral-1', chatId, { pinned: true });
+      await svc.remember('ephemeral-2', chatId, { archived: true });
+      expect(internal.sessionWrites.has('ephemeral-1')).toBe(true);
+      expect(internal.sessionWrites.has('ephemeral-2')).toBe(true);
+
+      // clearSession removes the entry once pending writes settle and repo.delete finishes.
+      await svc.clearSession('ephemeral-1');
+      expect(internal.sessionWrites.has('ephemeral-1')).toBe(false);
+
+      // A pre-clear write checking cleared() observes true AND does not resurrect the deleted entry.
+      expect(internal.cleared('ephemeral-1', 0)).toBe(true);
+      expect(internal.sessionWrites.has('ephemeral-1')).toBe(false);
+
+      // reload() prunes idle entries (pending.size === 0) while preserving entries with active writes.
+      let releaseWrite!: () => void;
+      const blocked = new Promise<void>(resolve => (releaseWrite = resolve));
+      repo.upsert.mockImplementationOnce(async () => {
+        await blocked;
+        return undefined;
+      });
+      const activeWrite = svc.remember('active-session', chatId, { pinned: true });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(internal.sessionWrites.get('active-session')?.pending.size).toBe(1);
+
+      await svc.reload();
+      expect(internal.sessionWrites.has('ephemeral-2')).toBe(false);
+      expect(internal.sessionWrites.has('active-session')).toBe(true);
+
+      releaseWrite();
+      await activeWrite;
+    });
   });
 });

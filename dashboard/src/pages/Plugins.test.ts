@@ -48,12 +48,19 @@ let extraPlugins: Record<string, unknown>[] = [];
 let disableGate: Promise<void> | undefined;
 // Whether GET /api/plugins answers with a server error, as it does while the plugin registry is unavailable.
 let pluginListFails = false;
+// What DELETE /api/plugins/:id answers; the plain answer is the one for a complete removal.
+const UNINSTALLED = `Plugin ${PLUGIN.id} uninstalled successfully`;
+let deleteReply: { success: boolean; message: string } = { success: true, message: UNINSTALLED };
+let configUiHtml: string | null = null;
 
 function installFetchStub(): void {
   globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     const path = url.replace(/^https?:\/\/[^/]+/, '');
     const method = init?.method ?? 'GET';
+    if (method === 'GET' && path === `/api/plugins/${PLUGIN.id}/config-ui` && configUiHtml !== null) {
+      return Promise.resolve(new Response(configUiHtml, { status: 200, headers: { 'Content-Type': 'text/html' } }));
+    }
     if (method === 'GET' && path === '/api/plugins') {
       if (pluginListFails) return Promise.resolve(jsonResponse({ message: 'plugin registry unavailable' }, 500));
       return Promise.resolve(jsonResponse([{ ...PLUGIN, sessionConfig, ...pluginOverride }, ...extraPlugins]));
@@ -68,7 +75,7 @@ function installFetchStub(): void {
     }
     if (method === 'POST' && path === '/api/plugins/install') return Promise.resolve(jsonResponse(PLUGIN));
     if (method === 'DELETE' && path === `/api/plugins/${PLUGIN.id}`) {
-      return Promise.resolve(jsonResponse({ success: true, message: 'Uninstalled' }));
+      return Promise.resolve(jsonResponse(deleteReply));
     }
     if (method === 'GET' && path === '/api/sessions') return Promise.resolve(jsonResponse([SESSION, SESSION_2]));
     if (method === 'PUT' && path === `/api/plugins/${PLUGIN.id}/config`) {
@@ -131,6 +138,9 @@ afterEach(() => {
   extraPlugins = [];
   disableGate = undefined;
   pluginListFails = false;
+  deleteReply = { success: true, message: UNINSTALLED };
+  configUiHtml = null;
+  document.head.querySelectorAll('meta[name="openwa-csp-nonce"]').forEach(el => el.remove());
   rtl.cleanup();
   queryClient?.clear();
   queryClient = undefined;
@@ -152,7 +162,7 @@ async function openSessionOverride(sessionLabel: string): Promise<void> {
   renderPlugins();
 
   fireEvent.click(await screen.findByTitle('Configure'));
-  fireEvent.click(await screen.findByRole('button', { name: 'Sessions' }));
+  fireEvent.click(await screen.findByRole('tab', { name: 'Sessions' }));
   const select = await screen.findByRole('combobox', { name: 'Select a session…' });
   await findByText(select, sessionLabel);
   fireEvent.change(select, { target: { value: SESSION.id } });
@@ -267,6 +277,86 @@ test('uninstalling a plugin reloads the catalog, whose installed flags it change
   }
 });
 
+/** Click Uninstall, wait for the toast titled `title` and for the refetches the uninstall started to settle. */
+async function uninstallAndReadToast(title: string): Promise<Element> {
+  const { screen, fireEvent, waitFor } = rtl;
+  const realConfirm = window.confirm;
+  window.confirm = () => true;
+  try {
+    renderPlugins();
+    await waitFor(() => assert.equal(catalogReads, 1));
+    fireEvent.click(await screen.findByTitle('Uninstall'));
+    const toast = (await screen.findByText(title)).closest('.toast');
+    assert.ok(toast, `no toast titled ${title}`);
+    await waitFor(() => assert.equal(catalogReads, 2));
+    await waitFor(() => assert.equal(queryClient?.isFetching(), 0));
+    return toast;
+  } finally {
+    window.confirm = realConfirm;
+  }
+}
+
+// A complete removal names the plugin as the operator's language shows it, not the server's English sentence.
+test('a plain uninstall answer shows the localized plugin name, not the server text', async () => {
+  pluginOverride = { i18n: { en: { name: 'Welcome bot' } } };
+
+  const toast = await uninstallAndReadToast('Plugin uninstalled');
+
+  assert.equal(toast.getAttribute('role'), 'status');
+  assert.equal(toast.querySelector('.toast-message')?.textContent, 'Welcome bot');
+  assert.ok(!toast.textContent?.includes(UNINSTALLED), toast.textContent ?? '');
+});
+
+// When only the final registry delete fails the uninstall still answers success, with a message naming the call that
+// removes the entry it left. The plugin's card is gone by then, so that message is the operator's only pointer.
+test('an uninstall that kept its registry entry warns with the answer that says how to remove it', async () => {
+  const kept =
+    'Plugin greeter uninstalled, but the plugin registry could not be written: registry.json keeps its entry, ' +
+    'emptied of config, sessions and the enable decision, reported at startup as a plugin with no code ' +
+    'until DELETE /api/plugins/greeter is repeated once the registry is writable';
+  deleteReply = { success: true, message: kept };
+
+  const toast = await uninstallAndReadToast('Plugin uninstalled, with a warning');
+
+  assert.equal(toast.getAttribute('role'), 'alert');
+  assert.equal(toast.querySelector('.toast-message')?.textContent, kept);
+});
+
+// The mount prefetch can still be in flight when a later read starts; its older answer must not replace the newer one.
+test('a catalog read that finishes after a newer one does not replace it', async () => {
+  const { screen, fireEvent, waitFor, act } = rtl;
+  const entry = (updateAvailable: boolean) => ({
+    id: PLUGIN.id,
+    name: 'Greeter',
+    version: updateAvailable ? '2.0.0' : '1.0.0',
+    installed: true,
+    installedVersion: '1.0.0',
+    updateAvailable,
+    download: 'https://example.invalid/greeter.zip',
+  });
+  let releaseFirst!: () => void;
+  catalogReply = () =>
+    catalogReads === 1
+      ? new Promise(resolve => (releaseFirst = () => resolve(jsonResponse([entry(true)]))))
+      : Promise.resolve(jsonResponse([entry(false)]));
+  const realConfirm = window.confirm;
+  window.confirm = () => true;
+  try {
+    renderPlugins();
+    await waitFor(() => assert.equal(catalogReads, 1));
+    fireEvent.click(await screen.findByTitle('Uninstall'));
+    await waitFor(() => assert.equal(catalogReads, 2));
+    await screen.findByText('Plugin uninstalled');
+    await act(async () => {
+      releaseFirst();
+      await new Promise(resolve => setTimeout(resolve, 20));
+    });
+    assert.equal(document.querySelector('.plugin-update-chip') === null, true, 'the older read replaced the newer');
+  } finally {
+    window.confirm = realConfirm;
+  }
+});
+
 test('uploading a plugin .zip reloads the catalog, whose installed flags it changed', async () => {
   const { screen, fireEvent, waitFor } = rtl;
   renderPlugins();
@@ -289,7 +379,7 @@ test('a config schema without properties opens the config modal and the Sessions
   renderPlugins();
   fireEvent.click(await screen.findByTitle('Configure'));
   assert.equal(screen.queryByRole('button', { name: 'Save Configuration' }) === null, true);
-  fireEvent.click(await screen.findByRole('button', { name: 'Sessions' }));
+  fireEvent.click(await screen.findByRole('tab', { name: 'Sessions' }));
   // No declared field means nothing to override per session.
   await screen.findByText('Run for');
   assert.equal(screen.queryByRole('combobox', { name: 'Select a session…' }) === null, true);
@@ -427,4 +517,73 @@ test("another plugin's action settling first keeps a pending plugin's buttons di
   assert.equal(within(greeter).getByTitle<HTMLButtonElement>('Uninstall').disabled, true);
 
   releaseDisable();
+});
+
+test('config-UI iframe stamps the CSP nonce only on inline scripts and skips SVG href and xlink:href scripts', async () => {
+  const { screen, fireEvent, waitFor } = rtl;
+  const meta = document.createElement('meta');
+  meta.name = 'openwa-csp-nonce';
+  meta.content = 'nonce-test-123';
+  document.head.appendChild(meta);
+  pluginOverride = { configUi: { entry: 'config/index.html', height: 420 } };
+  configUiHtml = [
+    '<!doctype html><html><body>',
+    '<script id="inline">window.inlineOk = 1;</script>',
+    '<script id="ext-src" src="https://evil.example/src.js"></script>',
+    '<svg><script id="svg-href" href="https://evil.example/href.js"></script></svg>',
+    '<svg xmlns:xlink="http://www.w3.org/1999/xlink"><script id="svg-xlink" xlink:href="https://evil.example/xlink.js"></script></svg>',
+    '</body></html>',
+  ].join('');
+
+  renderPlugins();
+  fireEvent.click(await screen.findByTitle('Configure'));
+
+  const iframe = await waitFor(() => {
+    const el = document.querySelector<HTMLIFrameElement>('iframe.plugin-config-ui-frame');
+    assert.ok(el, 'iframe should be rendered');
+    assert.ok(el.getAttribute('srcdoc'), 'iframe srcdoc should be populated');
+    return el;
+  });
+
+  const parsed = new DOMParser().parseFromString(iframe.getAttribute('srcdoc') ?? '', 'text/html');
+  assert.equal(parsed.getElementById('inline')?.getAttribute('nonce'), 'nonce-test-123');
+  assert.equal(parsed.getElementById('ext-src')?.getAttribute('nonce'), null);
+  assert.equal(parsed.getElementById('svg-href')?.getAttribute('nonce'), null);
+  assert.equal(parsed.getElementById('svg-xlink')?.getAttribute('nonce'), null);
+});
+
+test('config-UI hardening runs DOMParser once per html load and does not re-parse on re-render', async () => {
+  const { screen, fireEvent, waitFor, act } = rtl;
+  pluginOverride = { configUi: { entry: 'config/index.html' } };
+  configUiHtml = '<!doctype html><html><body><script>window.x = 1;</script></body></html>';
+
+  const origParse = DOMParser.prototype.parseFromString;
+  let parseCalls = 0;
+  DOMParser.prototype.parseFromString = function (str: string, type: DOMParserSupportedType) {
+    parseCalls++;
+    return origParse.call(this, str, type);
+  };
+  try {
+    renderPlugins();
+    fireEvent.click(await screen.findByTitle('Configure'));
+    await waitFor(() => {
+      const el = document.querySelector<HTMLIFrameElement>('iframe.plugin-config-ui-frame');
+      assert.ok(el?.getAttribute('srcdoc'));
+    });
+    assert.equal(parseCalls, 1);
+
+    // Trigger a genuine re-render of PluginConfigUi without changing html (handshake message + updated plugin query).
+    const iframe = document.querySelector<HTMLIFrameElement>('iframe.plugin-config-ui-frame');
+    assert.ok(iframe?.contentWindow);
+    await act(async () => {
+      window.dispatchEvent(
+        new window.MessageEvent('message', { data: { type: 'config:get' }, source: iframe.contentWindow }),
+      );
+    });
+    pluginOverride = { configUi: { entry: 'config/index.html', height: 500 } };
+    await act(() => queryClient!.refetchQueries({ queryKey: ['plugins'] }));
+    assert.equal(parseCalls, 1, 'DOMParser should not re-run when html has not changed');
+  } finally {
+    DOMParser.prototype.parseFromString = origParse;
+  }
 });

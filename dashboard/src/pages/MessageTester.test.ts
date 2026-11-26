@@ -145,7 +145,7 @@ function groupJsonResponse(data: unknown, status = 200): Response {
 }
 
 // How the first text send fails: an HTTP status, a fetch that never gets an answer, or a 201 with no message id.
-type FirstSendFailure = number | 'unreachable' | 'unconfirmed' | 'vetoed';
+type FirstSendFailure = number | 'unreachable' | 'unconfirmed' | 'empty-id' | 'vetoed';
 
 function stubGroupGateway(
   groups: { id: string; name?: string }[],
@@ -173,6 +173,9 @@ function stubGroupGateway(
       if (refuseFirstWith && textSends.length === 1) {
         if (refuseFirstWith === 'unreachable') return Promise.reject(new TypeError('Failed to fetch'));
         if (refuseFirstWith === 'unconfirmed') return Promise.resolve(groupJsonResponse({ timestamp: 1 }, 201));
+        if (refuseFirstWith === 'empty-id') {
+          return Promise.resolve(groupJsonResponse({ messageId: '', timestamp: 1 }, 201));
+        }
         // A plugin that vetoes one chat's send: the gateway answers 400 for that chat alone.
         if (refuseFirstWith === 'vetoed') {
           return Promise.resolve(groupJsonResponse({ message: 'Message sending blocked by plugin' }, 400));
@@ -322,7 +325,7 @@ test('a gateway that does not answer stops the run, and the notice says so', asy
 });
 
 // The page's own "no message id" failure has no HTTP status either, but the gateway did answer.
-test('a send answered without a message id fails that group and the run goes on', async () => {
+test('a send answered without a messageId field fails that group and the run goes on', async () => {
   const gateway = stubGroupGateway(
     [
       { id: 'g1@g.us', name: 'Family' },
@@ -338,6 +341,23 @@ test('a send answered without a message id fails that group and the run goes on'
   assert.deepEqual(gateway.textSends, ['g1@g.us', 'g2@g.us']);
   assert.ok(rtl.screen.getByText(/Failed to send message/, { selector: 'li' }));
   assert.equal(rtl.screen.queryByText(/stopped/) === null, true);
+});
+
+test('an accepted group send with an empty message id counts as sent', async () => {
+  const gateway = stubGroupGateway(
+    [
+      { id: 'g1@g.us', name: 'Family' },
+      { id: 'g2@g.us', name: 'Work' },
+    ],
+    'empty-id',
+  );
+  await renderGroupsAsWriter();
+  await sendTextToAllGroups();
+
+  await rtl.screen.findByText('2/2 sent', {}, { timeout: 8000 });
+  assert.deepEqual(gateway.textSends, ['g1@g.us', 'g2@g.us']);
+  assert.ok(rtl.screen.getByText('Success'));
+  assert.equal(rtl.screen.queryByText('Failed'), null);
 });
 
 test('a 502 from a reverse proxy stops the run, since the gateway behind it is down', async () => {
@@ -366,22 +386,24 @@ test('the recipient list is parsed when it changes, not on every other keystroke
   await rtl.screen.findByRole('option', { name: /Main/ });
   rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Bulk' }));
 
-  // Count the line splits of the list. Swapped by hand: the test runner does not restore a symbol-keyed method.
+  // Count the phone normalization of the list: a textarea value read replaces other patterns in the same text.
   const list = '628111222333\n628222333444';
-  let parses = 0;
-  const split = RegExp.prototype[Symbol.split];
-  RegExp.prototype[Symbol.split] = function (this: RegExp, text: string, limit?: number) {
-    if (text === list) parses++;
-    return split.call(this, text, limit);
+  const fullWidth = /[\uFF01-\uFF5E]/g;
+  let normalizations = 0;
+  const replace = RegExp.prototype[Symbol.replace];
+  RegExp.prototype[Symbol.replace] = function (this: RegExp, text: string, replacement: unknown): string {
+    if (text === list && this.source === fullWidth.source && this.flags === fullWidth.flags) normalizations++;
+    return Reflect.apply(replace, this, [text, replacement]) as string;
   };
   try {
     type(container, '#mt-11', list);
-    const afterList = parses;
-    assert.ok(afterList >= 1, 'the list was not parsed');
+    assert.ok(rtl.screen.getByText(/Recipients: 2$/));
+    const afterList = normalizations;
+    assert.ok(afterList >= 1, 'the list was not normalized');
     for (const text of ['a', 'ab', 'abc']) type(container, '#mt-12', text);
-    assert.equal(parses, afterList);
+    assert.equal(normalizations, afterList);
   } finally {
-    RegExp.prototype[Symbol.split] = split;
+    RegExp.prototype[Symbol.replace] = replace;
   }
 });
 
@@ -1019,12 +1041,12 @@ for (const mode of ['text', 'forward'] as const) {
           return jsonResponse({ number: '15550000001', exists: true, whatsappId: 'primary@lid' });
         }
         if (url.includes('/messages/')) {
-          writes.push({ key: new Headers(init?.headers).get('X-API-Key'), body: JSON.parse(String(init?.body)) });
+          writes.push({ key: sessionStorage.getItem('openwa_api_key_id'), body: JSON.parse(String(init?.body)) });
           return jsonResponse({ messageId: 'sent', timestamp: 1 });
         }
         return jsonResponse([]);
       }) as typeof fetch;
-      sessionStorage.setItem('openwa_api_key', 'original-key');
+      sessionStorage.setItem('openwa_api_key_id', 'original-key');
       sessionStorage.setItem('openwa_user_role', 'operator');
       const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
       const tree = () =>
@@ -1040,12 +1062,12 @@ for (const mode of ['text', 'forward'] as const) {
       await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
       rtl.fireEvent.click(sendButton());
       await rtl.waitFor(() => assert.equal(lookups, mode === 'text' ? 1 : 2));
-      if (change === 'replace key') sessionStorage.setItem('openwa_api_key', 'replacement-key');
-      if (change === 'sign out') sessionStorage.removeItem('openwa_api_key');
+      if (change === 'replace key') sessionStorage.setItem('openwa_api_key_id', 'replacement-key');
+      if (change === 'sign out') sessionStorage.removeItem('openwa_api_key_id');
       if (change === 'unmount' || change === 'sign in again') view.unmount();
       if (change === 'sign in again') {
-        sessionStorage.removeItem('openwa_api_key');
-        sessionStorage.setItem('openwa_api_key', 'original-key');
+        sessionStorage.removeItem('openwa_api_key_id');
+        sessionStorage.setItem('openwa_api_key_id', 'original-key');
         client.clear();
         rtl.render(tree());
         await rtl.screen.findByRole('option', { name: /Main/ });
@@ -1056,7 +1078,7 @@ for (const mode of ['text', 'forward'] as const) {
       });
       assert.deepEqual(writes, [], 'the abandoned lookup issued a write');
       client.clear();
-      sessionStorage.removeItem('openwa_api_key');
+      sessionStorage.removeItem('openwa_api_key_id');
     });
   }
 }
@@ -1079,7 +1101,7 @@ for (const [script, zero] of [
       if (path.includes('/messages/')) return jsonResponse({ messageId: 'sent', timestamp: 1 });
       return jsonResponse([]);
     }) as typeof fetch;
-    sessionStorage.setItem('openwa_api_key', 'original-key');
+    sessionStorage.setItem('openwa_api_key_id', 'original-key');
     sessionStorage.setItem('openwa_user_role', 'operator');
     const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
     const view = rtl.render(
@@ -1098,10 +1120,190 @@ for (const [script, zero] of [
       assert.deepEqual(checked, ['15550000001', '15550000002']);
     } finally {
       client.clear();
-      sessionStorage.removeItem('openwa_api_key');
+      sessionStorage.removeItem('openwa_api_key_id');
     }
   });
 }
+
+// A space inside a number is formatting, so two numbers pasted with a space between them read as one run of digits.
+// No phone number has more than 15, so such a run is refused before the number check rather than looked up or split.
+for (const field of ['recipient', 'forward target'] as const) {
+  test(`a ${field} longer than any phone number is refused without a lookup or a send`, async () => {
+    const checked: string[] = [];
+    const sent: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path.endsWith('/sessions')) return jsonResponse([{ id: 's1', name: 'Main', status: 'ready' }]);
+      if (path.includes('/contacts/check/')) {
+        const number = path.split('/contacts/check/')[1];
+        checked.push(number);
+        return jsonResponse({ number, exists: true, whatsappId: `${number}@c.us` });
+      }
+      if (path.includes('/messages/')) {
+        sent.push(path);
+        return jsonResponse({ messageId: 'sent', timestamp: 1 });
+      }
+      return jsonResponse([]);
+    }) as typeof fetch;
+    sessionStorage.setItem('openwa_api_key_id', 'original-key');
+    sessionStorage.setItem('openwa_user_role', 'operator');
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
+    const view = rtl.render(
+      createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
+    );
+    try {
+      await rtl.screen.findByRole('option', { name: /Main/ });
+      const joined = '628111222333 628222333444';
+      // A formatted number of 13 digits is still one number.
+      type(view.container, '#mt-13', field === 'recipient' ? joined : '+62 812 3456 7890');
+      if (field === 'recipient') {
+        type(view.container, '#mt-2', 'hello');
+      } else {
+        rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Forward' }));
+        type(view.container, '#mt-9', joined);
+        type(view.container, '#mt-10', 'original-message');
+      }
+      await rtl.waitFor(() => assert.equal(sendButton().disabled, false));
+      rtl.fireEvent.click(sendButton());
+      // The refusal names its reason: the number was never looked up, so nothing is said about its registration.
+      await rtl.screen.findByText('More than 15 digits is not one phone number. Enter one number.');
+      assert.deepEqual(checked, field === 'recipient' ? [] : ['6281234567890'], 'the joined digits were looked up');
+      assert.deepEqual(sent, [], 'a message was sent');
+    } finally {
+      client.clear();
+      sessionStorage.removeItem('openwa_api_key_id');
+    }
+  });
+}
+
+// The number check and the send of one personal recipient, recorded, with every number answered as unregistered.
+function stubPersonalSend(): { checked: string[]; writes: unknown[] } {
+  const record = { checked: [] as string[], writes: [] as unknown[] };
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path.endsWith('/sessions')) return jsonResponse([{ id: 's1', name: 'Main', status: 'ready' }]);
+    if (path.includes('/contacts/check')) {
+      record.checked.push(path.split('/contacts/check')[1]);
+      return jsonResponse({ number: '0', exists: false });
+    }
+    if (path.includes('/messages/')) {
+      record.writes.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ messageId: 'sent', timestamp: 1 });
+    }
+    return jsonResponse([]);
+  }) as typeof fetch;
+  sessionStorage.setItem('openwa_api_key_id', 'original-key');
+  sessionStorage.setItem('openwa_user_role', 'operator');
+  return record;
+}
+
+function renderTesterForKey(): { container: HTMLElement; client: QueryClient } {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
+  const view = rtl.render(
+    createElement(QueryClientProvider, { client }, createElement(RoleProvider, null, createElement(MessageTester))),
+  );
+  return { container: view.container, client };
+}
+
+// Read as a phone number, a pasted chat id lost its meaning: a lid's digits were looked up as a number nobody has,
+// and a device suffix was glued onto the phone, making a different number that could belong to a stranger.
+for (const chatId of ['185290012345678@lid', '628123456789:5@s.whatsapp.net']) {
+  test(`a recipient written as a chat id (${chatId}) is sent to as it is, without a number lookup`, async () => {
+    const { checked, writes } = stubPersonalSend();
+    const { container, client } = renderTesterForKey();
+    try {
+      await rtl.screen.findByRole('option', { name: /Main/ });
+      type(container, '#mt-13', ` ${chatId} `);
+      type(container, '#mt-2', 'hello');
+      rtl.fireEvent.click(sendButton());
+      await rtl.waitFor(() => assert.ok(writes.length + checked.length > 0));
+      assert.deepEqual(checked, [], 'the chat id was looked up as a phone number');
+      assert.deepEqual(writes, [{ chatId, text: 'hello' }]);
+    } finally {
+      client.clear();
+      sessionStorage.removeItem('openwa_api_key_id');
+    }
+  });
+}
+
+// No phone number starts with 0, so `00` in front of one is the international exit code. Kept, it made a registered
+// number look unregistered, and a full-length number written with it read as more than one number.
+for (const [typed, number] of [
+  ['00376 612 345', '376612345'],
+  ['00 49 151 2345 6789', '4915123456789'],
+  ['00 123 456 789 012 345', '123456789012345'],
+] as const) {
+  test(`a recipient written as ${typed} is looked up without its 00 exit code`, async () => {
+    const { checked } = stubPersonalSend();
+    const { container, client } = renderTesterForKey();
+    try {
+      await rtl.screen.findByRole('option', { name: /Main/ });
+      type(container, '#mt-13', typed);
+      type(container, '#mt-2', 'hello');
+      rtl.fireEvent.click(sendButton());
+      await rtl.screen.findAllByText(/not registered|More than 15 digits/);
+      assert.deepEqual(checked, [`/${number}`]);
+    } finally {
+      client.clear();
+      sessionStorage.removeItem('openwa_api_key_id');
+    }
+  });
+}
+
+// With no digit and no @ there is no number to check: the lookup went out as GET .../contacts/check/, which the gateway
+// routes to the contact read with the id "check", and the tester showed that answer instead of asking for a number.
+// The 00 exit code is no digit of a number, so a field holding only that names nothing either, however it is spaced.
+// A full-width @ (U+FF20) is no chat id: the send reads the text as typed and finds no number in it.
+for (const typed of [' abc ', '00', '+00', '0 0', String.fromCharCode(0xff20)]) {
+  for (const field of ['recipient', 'forward target'] as const) {
+    test(`a ${field} written as ${JSON.stringify(typed)} names no number and holds Send`, async () => {
+      const { checked } = stubPersonalSend();
+      const { container, client } = renderTesterForKey();
+      try {
+        await rtl.screen.findByRole('option', { name: /Main/ });
+        type(container, '#mt-13', field === 'recipient' ? typed : '15550000001');
+        if (field === 'recipient') {
+          type(container, '#mt-2', 'hello');
+        } else {
+          rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Forward' }));
+          type(container, '#mt-9', typed);
+          type(container, '#mt-10', 'original-message');
+        }
+        assert.equal(sendButton().disabled, true, 'Send was offered for a field with no number in it');
+        rtl.fireEvent.click(sendButton());
+        assert.deepEqual(checked, []);
+      } finally {
+        client.clear();
+        sessionStorage.removeItem('openwa_api_key_id');
+      }
+    });
+  }
+}
+
+// The recipient is only the default chat a forward is taken from. With From Chat ID filled it goes unused, yet Send
+// still required it and its lookup ran first, so a stale or mistyped number refused the forward as "not registered".
+test('a forward from a named chat neither needs nor looks up the personal recipient', async () => {
+  const { checked, writes } = stubPersonalSend();
+  const { container, client } = renderTesterForKey();
+  try {
+    await rtl.screen.findByRole('option', { name: /Main/ });
+    rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Forward' }));
+    type(container, '#mt-17', '120363000000000000@g.us');
+    type(container, '#mt-9', '120363999999999999@g.us');
+    type(container, '#mt-10', 'original-message');
+    assert.equal(sendButton().disabled, false, 'Send waited for a recipient the forward does not use');
+    type(container, '#mt-13', '123');
+    rtl.fireEvent.click(sendButton());
+    await rtl.waitFor(() => assert.ok(writes.length + checked.length > 0));
+    assert.deepEqual(checked, [], 'the unused recipient was looked up');
+    assert.deepEqual(writes, [
+      { fromChatId: '120363000000000000@g.us', toChatId: '120363999999999999@g.us', messageId: 'original-message' },
+    ]);
+  } finally {
+    client.clear();
+    sessionStorage.removeItem('openwa_api_key_id');
+  }
+});
 
 test('an unchanged actor sends to canonical personal and forward destinations', async () => {
   const writes: { path: string; key: string | null; body: unknown }[] = [];
@@ -1115,12 +1317,12 @@ test('an unchanged actor sends to canonical personal and forward destinations', 
         whatsappId: path.endsWith('2') ? 'destination@lid' : 'primary@lid',
       });
     if (path.includes('/messages/')) {
-      writes.push({ path, key: new Headers(init?.headers).get('X-API-Key'), body: JSON.parse(String(init?.body)) });
+      writes.push({ path, key: sessionStorage.getItem('openwa_api_key_id'), body: JSON.parse(String(init?.body)) });
       return jsonResponse({ messageId: 'sent', timestamp: 1 });
     }
     return jsonResponse([]);
   }) as typeof fetch;
-  sessionStorage.setItem('openwa_api_key', 'original-key');
+  sessionStorage.setItem('openwa_api_key_id', 'original-key');
   sessionStorage.setItem('openwa_user_role', 'operator');
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
   const view = rtl.render(
@@ -1146,11 +1348,11 @@ test('an unchanged actor sends to canonical personal and forward destinations', 
     messageId: 'original-message',
   });
   client.clear();
-  sessionStorage.removeItem('openwa_api_key');
+  sessionStorage.removeItem('openwa_api_key_id');
 });
 
 test('replacing the key stops a sequential group send and releases the composer', async () => {
-  sessionStorage.setItem('openwa_api_key', 'original-key');
+  sessionStorage.setItem('openwa_api_key_id', 'original-key');
   const gateway = stubGroupGateway([
     { id: 'g1@g.us', name: 'Family' },
     { id: 'g2@g.us', name: 'Work' },
@@ -1158,12 +1360,12 @@ test('replacing the key stops a sequential group send and releases the composer'
   await renderGroupsAsWriter();
   await sendTextToAllGroups();
   await rtl.waitFor(() => assert.equal(gateway.textSends.length, 1));
-  sessionStorage.setItem('openwa_api_key', 'replacement-key');
+  sessionStorage.setItem('openwa_api_key_id', 'replacement-key');
   await rtl.waitFor(() => assert.equal(sendMessageButton().disabled, false), { timeout: 4000 });
   assert.deepEqual(gateway.textSends, ['g1@g.us']);
   assert.equal(field(window.document.body, '#mt-2').matches(':disabled'), false);
   assert.equal(rtl.screen.queryByText('Success'), null);
-  sessionStorage.removeItem('openwa_api_key');
+  sessionStorage.removeItem('openwa_api_key_id');
 });
 
 test('an old lookup cannot complete a new operation after signing in with the same key', async () => {
@@ -1182,7 +1384,7 @@ test('an old lookup cannot complete a new operation after signing in with the sa
     }
     return jsonResponse([]);
   }) as typeof fetch;
-  sessionStorage.setItem('openwa_api_key', 'same-key');
+  sessionStorage.setItem('openwa_api_key_id', 'same-key');
   sessionStorage.setItem('openwa_user_role', 'operator');
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1 } } });
   const render = () =>
@@ -1200,8 +1402,8 @@ test('an old lookup cannot complete a new operation after signing in with the sa
   await rtl.waitFor(() => assert.equal(releases.length, 1));
   original.unmount();
   client.clear();
-  sessionStorage.removeItem('openwa_api_key');
-  sessionStorage.setItem('openwa_api_key', 'same-key');
+  sessionStorage.removeItem('openwa_api_key_id');
+  sessionStorage.setItem('openwa_api_key_id', 'same-key');
   const current = render();
   await start(current, 'new operation');
   await rtl.waitFor(() => assert.equal(releases.length, 2));
@@ -1223,7 +1425,7 @@ test('an old lookup cannot complete a new operation after signing in with the sa
   assert.deepEqual(writes, [{ chatId: 'canonical@lid', text: 'new operation' }]);
   assert.ok(rtl.screen.getByText('new-operation'));
   client.clear();
-  sessionStorage.removeItem('openwa_api_key');
+  sessionStorage.removeItem('openwa_api_key_id');
 });
 
 // A phone number or chat id typed into a plain text field is laid out right to left in an Arabic or Hebrew

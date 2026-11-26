@@ -27,7 +27,8 @@ export interface LogContext {
 // Defense-in-depth: redact the VALUES of secret-named keys before they reach the log sink, so a
 // careless `logger.info('…', { password })` can't leak a credential. Matches the key NAME only
 // (case-insensitive), never the value's content, to avoid false positives on innocuous fields.
-const SECRET_KEY_PATTERN = /password|passwd|secret|token|api[-_]?key|authorization|credential|pepper|private[-_]?key/i;
+const SECRET_KEY_PATTERN =
+  /password|passwd|secret|token|api[-_]?key|authorization|credential|pepper|private[-_]?key|(?:set[-_]?)?cookie|proxy[-_]?url|x-openwa-forwarded-sig/i;
 
 // Metadata is copied whole down to this depth, however wide, which is where it normally lives; only REDACT_MAX_ENTRIES
 // bounds that part. Below it one copy takes at most REDACT_DEEP_NODES more objects and arrays and writes the rest as
@@ -280,6 +281,31 @@ const LEVEL_LABEL: Record<LogLevel, string> = {
 // Keys that are rendered in the line prefix rather than the trailing metadata.
 const STRUCTURAL_KEYS = new Set(['timestamp', 'level', 'context', 'message', 'trace']);
 
+// The pretty format is read line by line, so text a caller did not write (a contact's name, a plugin's metadata, a
+// request value) must not start a line of its own that reads as another record, or send a terminal an escape
+// sequence. Control characters are written as escapes, and so are the two Unicode line separators, which a reader that
+// splits lines (Python's splitlines, a multiline regex) breaks on as it does on a newline; a tab stays, since it
+// cannot start a line.
+// eslint-disable-next-line no-control-regex
+const PRETTY_CONTROLS = /[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]/g;
+const escapeControl = (char: string): string => {
+  if (char === '\n') return '\\n';
+  if (char === '\r') return '\\r';
+  const code = char.charCodeAt(0);
+  return code > 0xff ? `\\u${code.toString(16).padStart(4, '0')}` : `\\x${code.toString(16).padStart(2, '0')}`;
+};
+const escapeControls = (text: string): string => text.replace(PRETTY_CONTROLS, escapeControl);
+
+// A stack trace opens with the error's message, which can be text the caller did not write, and its lines are the one
+// place the format keeps line breaks. So a trace is held to the same rule as the rest: the controls other than the
+// line break and the tab are written as escapes, and every line that would start at the left edge, where a record
+// begins, the first one included, is indented. The frames of a real stack already start with spaces and are left as
+// they are, and a blank line stays blank.
+// eslint-disable-next-line no-control-regex
+const PRETTY_TRACE_CONTROLS = /[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]/g;
+const escapeTrace = (trace: string): string =>
+  trace.replace(PRETTY_TRACE_CONTROLS, escapeControl).replace(/(^|\n)(?=[^ \t\n])/g, '$1    ');
+
 @Injectable({ scope: Scope.TRANSIENT })
 export class LoggerService implements NestLoggerService {
   private context: string = 'Application';
@@ -419,14 +445,14 @@ export class LoggerService implements NestLoggerService {
     const levelColor = LEVEL_COLOR[level];
     const label = LEVEL_LABEL[level].padStart(7);
     const timestamp = new Date(String(entry.timestamp)).toLocaleString();
-    const contextName = String(entry.context);
-    const message = String(entry.message);
+    const contextName = escapeControls(String(entry.context));
+    const message = escapeControls(String(entry.message));
 
     // Trailing structured metadata (sessionId, action, duration, …) shown dimmed as key=value pairs.
     const formatValue = (value: unknown): string => (typeof value === 'string' ? value : (JSON.stringify(value) ?? ''));
     const meta = Object.entries(entry)
       .filter(([key, value]) => !STRUCTURAL_KEYS.has(key) && value !== undefined)
-      .map(([key, value]) => `${key}=${formatValue(value)}`)
+      .map(([key, value]) => `${escapeControls(key)}=${escapeControls(formatValue(value))}`)
       .join(' ');
 
     let line =
@@ -439,25 +465,14 @@ export class LoggerService implements NestLoggerService {
 
     // Error stack traces print on their own line(s), like NestJS.
     if (typeof entry.trace === 'string' && entry.trace) {
-      line += `\n${paint(levelColor, entry.trace)}`;
+      line += `\n${paint(levelColor, escapeTrace(entry.trace))}`;
     }
 
     return line;
   }
 
   private static resolveFormat(): LogFormat {
-    if (LoggerService.logFormat) return LoggerService.logFormat;
-
-    const explicit = process.env.LOG_FORMAT?.trim().toLowerCase();
-    if (explicit === LogFormat.JSON || explicit === LogFormat.PRETTY) {
-      return explicit;
-    }
-
-    // No explicit choice: structured JSON in production (containers, log aggregators),
-    // human-readable pretty everywhere else. This mirrors NestJS's own logger, which
-    // always prints its text format — and unlike a TTY check it stays correct when
-    // stdout is piped through a dev runner (e.g. `concurrently` in `npm run dev`).
-    return process.env.NODE_ENV === 'production' ? LogFormat.JSON : LogFormat.PRETTY;
+    return LoggerService.logFormat ?? logFormatFromEnv();
   }
 
   private static colorEnabled(): boolean {
@@ -472,6 +487,35 @@ export class LoggerService implements NestLoggerService {
     const currentIndex = levels.indexOf(LoggerService.logLevel);
     const targetIndex = levels.indexOf(level);
     return targetIndex <= currentIndex;
+  }
+}
+
+/**
+ * The format LOG_FORMAT selects, read per write: `json` or `pretty` in any case and padding. Anything
+ * else, unset included, is the NODE_ENV default.
+ */
+export function logFormatFromEnv(env: NodeJS.ProcessEnv = process.env): LogFormat {
+  const explicit = env.LOG_FORMAT?.trim().toLowerCase();
+  if (explicit === LogFormat.JSON || explicit === LogFormat.PRETTY) {
+    return explicit;
+  }
+
+  // No explicit choice: structured JSON in production (containers, log aggregators),
+  // human-readable pretty everywhere else. This mirrors NestJS's own logger, which
+  // always prints its text format, and unlike a TTY check it stays correct when
+  // stdout is piped through a dev runner (e.g. `concurrently` in `npm run dev`).
+  return env.NODE_ENV === 'production' ? LogFormat.JSON : LogFormat.PRETTY;
+}
+
+/**
+ * Apply LOG_LEVEL as boot reads it: trimmed, lower-cased, and only a level this logger knows. A
+ * misspelling is skipped here and refused by validateEnv with its own message. Shared by the env
+ * loader and main.ts so the two cannot read the variable differently.
+ */
+export function applyLogLevelFromEnv(raw: string | undefined = process.env.LOG_LEVEL): void {
+  const requested = raw?.trim().toLowerCase();
+  if (requested && (Object.values(LogLevel) as string[]).includes(requested)) {
+    LoggerService.setLogLevel(requested as LogLevel);
   }
 }
 

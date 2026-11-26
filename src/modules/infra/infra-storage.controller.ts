@@ -20,6 +20,7 @@ import {
 import { RequireRole, RequireUnscopedKey } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
 import { isPathWithin } from '../../common/utils/path-safety';
+import { ensurePrivateDir } from '../../common/utils/private-dir.util';
 import { StorageService } from '../../common/storage/storage.service';
 import { StorageWalkRefusedError } from '../../common/storage/storage-local-files';
 import { createLogger } from '../../common/services/logger.service';
@@ -99,6 +100,11 @@ export class InfraStorageController implements OnApplicationBootstrap {
       }
       return;
     }
+
+    // An archive an earlier version wrote sits in a directory it left 0755, and the migration flow keeps it across
+    // this restart: close the directory, as the media root is at every boot. Only once it was read, so a
+    // deployment that never exported gets no directory made.
+    ensurePrivateDir(exportDir);
 
     const now = Date.now();
     for (const entry of entries) {
@@ -184,29 +190,34 @@ export class InfraStorageController implements OnApplicationBootstrap {
     await this.assertStorageBackendReady();
     // Note: In production, this would return a StreamableFile
     // For simplicity, we'll save to a temp file and return the path
-    const stream = await this.storageService
-      .createExportStream()
-      .catch((error: unknown) => InfraStorageController.refusalAsConflict(error));
     // Keep the export INSIDE data/ (under data/exports/): the import handler only accepts paths under
     // data/, and the documented backend-migration flow re-imports this file AFTER a container restart,
     // so it must live on the persistent volume — the OS temp dir is wiped on restart. The original
     // unbounded-accumulation leak is addressed by the TTL sweep below + a collision-proof filename
     // (a per-call UUID), not by relocating off the volume.
     const exportDir = path.join(process.cwd(), 'data', 'exports');
+    // The archive is a copy of every stored file, so it is as private as the store: an owner-only directory and
+    // file. mkdir's mode applies only to a directory it creates, so one an earlier version left 0755 is tightened
+    // too (best effort: a directory this process does not own keeps its mode).
     if (!fs.existsSync(exportDir)) {
-      fs.mkdirSync(exportDir, { recursive: true });
+      fs.mkdirSync(exportDir, { recursive: true, mode: 0o700 });
     }
+    ensurePrivateDir(exportDir);
     const exportPath = path.join(exportDir, `storage-export-${Date.now()}-${randomUUID()}.tar.gz`);
 
-    const writeStream = fs.createWriteStream(exportPath);
-    stream.pipe(writeStream);
-
+    // Created only once the destination can be prepared: the archive starts reading files at once, and one
+    // nothing consumes would hold its open file and buffered bytes until the process exits.
+    const stream = await this.storageService
+      .createExportStream()
+      .catch((error: unknown) => InfraStorageController.refusalAsConflict(error));
+    let writeStream: fs.WriteStream | undefined;
     try {
+      const sink = (writeStream = fs.createWriteStream(exportPath, { mode: 0o600 }));
       await new Promise<void>((resolve, reject) => {
-        writeStream.on('finish', resolve);
+        sink.on('finish', resolve);
         // The archive is filled while it is written: destroying the source stops the export from
         // opening further files once the sink has failed.
-        writeStream.on('error', (err: Error) => {
+        sink.on('error', (err: Error) => {
           stream.destroy();
           reject(err);
         });
@@ -214,15 +225,21 @@ export class InfraStorageController implements OnApplicationBootstrap {
         // the source stream, which without a listener crashes the process. Fail the request instead and
         // tear down the sink so its fd isn't held open waiting for a 'finish' that never comes.
         stream.on('error', (err: Error) => {
-          writeStream.destroy();
+          sink.destroy();
           reject(err);
         });
+        stream.pipe(sink);
       });
     } catch (error) {
       // The TTL sweep below only covers a finished archive; a failed one would otherwise stay on the
       // data volume until a restart a day later. Wait for the sink to close so the unlink cannot race
       // an open that is still pending.
-      if (!writeStream.closed) await new Promise<void>(resolve => writeStream.once('close', () => resolve()));
+      stream.destroy();
+      if (writeStream) {
+        const sink = writeStream;
+        sink.destroy();
+        if (!sink.closed) await new Promise<void>(resolve => sink.once('close', () => resolve()));
+      }
       await fs.promises.unlink(exportPath).catch(() => undefined);
       throw error;
     }
@@ -284,7 +301,23 @@ export class InfraStorageController implements OnApplicationBootstrap {
       throw new BadRequestException(`File not found: ${filePath}`);
     }
 
-    const readStream = fs.createReadStream(resolved);
+    let realDataDir: string;
+    let realTarget: string;
+    try {
+      realDataDir = fs.realpathSync(dataDir);
+      realTarget = fs.realpathSync(resolved);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new BadRequestException('Import file not found');
+      }
+      throw error;
+    }
+
+    if (!isPathWithin(realDataDir, realTarget)) {
+      throw new BadRequestException('filePath must reference a file inside the data directory');
+    }
+
+    const readStream = fs.createReadStream(realTarget);
     // importFromStream rejects on archive/gzip/read failures (its streams carry error listeners, so a
     // bad file fails the request instead of crashing the process on an unhandled 'error' event). The
     // failures that reach here are almost always a problem with the caller-supplied file (not a gzip,

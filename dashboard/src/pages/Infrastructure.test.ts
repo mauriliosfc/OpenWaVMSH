@@ -107,6 +107,8 @@ let overrides: {
   saveProfiles?: string[];
   saveGate?: Promise<void>;
   readyFails?: boolean;
+  // Holds the backup export's answer back (an export still being built).
+  exportGate?: Promise<void>;
 } = {};
 
 // ENGINE_TYPE supplied by the container environment, so the dashboard cannot change it.
@@ -205,10 +207,13 @@ function installFetchStub(): void {
       if (overrides.readyFails) return Promise.resolve(jsonResponse({ status: 'error', details: {} }, 503));
       return Promise.resolve(jsonResponse({ status: 'ok', details: {} }));
     }
-    if (method === 'GET' && path === '/api/infra/export-data') {
-      return Promise.resolve(
-        jsonResponse({ exportedAt: new Date(0).toISOString(), dataDbType: 'postgres', tables: {}, counts: {} }),
-      );
+    if (
+      method === 'GET' &&
+      (path === '/api/infra/export-data' || path === '/api/infra/export-data?includePluginSecrets=true')
+    ) {
+      const answer = () =>
+        jsonResponse({ exportedAt: new Date(0).toISOString(), dataDbType: 'postgres', tables: {}, counts: {} });
+      return overrides.exportGate ? overrides.exportGate.then(answer) : Promise.resolve(answer());
     }
     if (method === 'POST' && path === '/api/infra/import-data') {
       return Promise.resolve(jsonResponse({ imported: true, counts: {} }));
@@ -283,6 +288,75 @@ function renderInfrastructure() {
     ),
   );
 }
+
+test('the configuration footer reserves and releases the toast stack space', async t => {
+  const originalObserver = globalThis.ResizeObserver;
+  const originalScroll = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollIntoView');
+  const updates = new Set<() => void>();
+  let stackHeight = 100;
+  let revealed = 0;
+  globalThis.ResizeObserver = class {
+    private update: () => void;
+    constructor(callback: ResizeObserverCallback) {
+      this.update = () => callback([], this);
+    }
+    observe() {
+      updates.add(this.update);
+    }
+    unobserve() {}
+    disconnect() {
+      updates.delete(this.update);
+    }
+  };
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+    configurable: true,
+    value() {
+      revealed++;
+    },
+  });
+  t.after(() => {
+    globalThis.ResizeObserver = originalObserver;
+    if (originalScroll) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', originalScroll);
+    else delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+  });
+  const getRect = HTMLElement.prototype.getBoundingClientRect;
+  t.mock.method(HTMLElement.prototype, 'getBoundingClientRect', function (this: HTMLElement) {
+    if (this.classList.contains('toast-container')) {
+      return new DOMRect(900, window.innerHeight - stackHeight - 24, 320, stackHeight);
+    }
+    if (this.parentElement?.classList.contains('page-footer'))
+      return new DOMRect(950, window.innerHeight - 70, 250, 44);
+    return getRect.call(this);
+  });
+  const { useToast } = await import('../hooks/useToast.ts');
+  function NoticeControl() {
+    const toast = useToast();
+    return createElement('button', { onClick: () => toast.error('Save refused') }, 'Add notice');
+  }
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 1_000 } } });
+  const { container } = rtl.render(
+    createElement(
+      QueryClientProvider,
+      { client: queryClient },
+      createElement(ToastProvider, null, createElement(Infrastructure), createElement(NoticeControl)),
+    ),
+  );
+  await rtl.screen.findByRole('button', { name: 'Save Configuration' });
+  const footer = container.querySelector<HTMLElement>('.page-footer')!;
+  assert.equal(footer.style.getPropertyValue('--toast-stack-height'), '0px');
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Add notice' }));
+  assert.equal(footer.style.getPropertyValue('--toast-stack-height'), '124px');
+  assert.ok(revealed > 0);
+  stackHeight = 180;
+  rtl.act(() => updates.forEach(update => update()));
+  assert.equal(footer.style.getPropertyValue('--toast-stack-height'), '204px');
+  rtl.fireEvent.click(rtl.screen.getByRole('button', { name: 'Close' }));
+  assert.equal(footer.style.getPropertyValue('--toast-stack-height'), '0px');
+  rtl.cleanup();
+  assert.equal(updates.size, 0);
+  const css = readFileSync(new URL('./Infrastructure.css', import.meta.url), 'utf8');
+  assert.match(css, /\.infrastructure-page \.page-footer\s*\{[^}]*padding-bottom:\s*var\(--toast-stack-height, 0px\)/);
+});
 
 // ── Smoke tests ──────────────────────────────────────────────────────────────
 
@@ -375,14 +449,20 @@ test('the storage badge names local storage in the active language', async () =>
  * covers the rest of them, and every other page, structurally.
  */
 test('every rendered toggle exposes an accessible name from its visible caption', async () => {
-  const { screen } = rtl;
+  const { screen, waitFor } = rtl;
   resetFetchCalls();
   const { container } = renderInfrastructure();
   await screen.findByText('Database Configuration');
 
-  const toggles = Array.from(container.querySelectorAll('label.toggle-switch input[type="checkbox"]'));
-  // Guards against a vacuous pass if the page ever stops rendering toggles under this fixture.
-  assert.ok(toggles.length >= 4, `expected the open sections to render toggles, found ${toggles.length}`);
+  const renderedToggles = () => Array.from(container.querySelectorAll('label.toggle-switch input[type="checkbox"]'));
+  // The toggles render once the page's reads have answered, which can be after its heading: counting them at once
+  // found none on a slow run. Waiting for the count is also the guard against a vacuous pass if the page ever stops
+  // rendering toggles under this fixture.
+  await waitFor(() => {
+    const found = renderedToggles().length;
+    assert.ok(found >= 4, `expected the open sections to render toggles, found ${found}`);
+  });
+  const toggles = renderedToggles();
 
   const unnamed = toggles
     .map(input => {
@@ -513,6 +593,26 @@ test('a successful save opens the restart modal', async () => {
   // unmount) is covered by the last test in this file.
   within(dialog).getByRole('button', { name: 'Restart Now' });
   within(dialog).getByRole('button', { name: 'Restart Later' });
+});
+
+// The restart closes the database and drops open connections, so an export still being built is cut and no
+// backup file arrives, while the failure reads as the connection loss a restart is expected to cause.
+test('Restart Now waits for a backup export in flight', async () => {
+  const { screen, waitFor, fireEvent, within } = rtl;
+  resetFetchCalls();
+  let release: () => void = () => {};
+  overrides = { exportGate: new Promise<void>(resolve => (release = resolve)) };
+  renderInfrastructure();
+
+  await screen.findByText('Database Configuration');
+  fireEvent.click(screen.getByRole('button', { name: 'Export data' }));
+  await waitFor(() => assert.ok(findFetchCall('GET', '/api/infra/export-data')));
+  fireEvent.click(screen.getByRole('button', { name: 'Save Configuration' }));
+
+  const restartNow = within(await screen.findByRole('dialog')).getByRole('button', { name: 'Restart Now' });
+  assert.equal((restartNow as HTMLButtonElement).disabled, true, 'a restart was offered while the export ran');
+  release();
+  await waitFor(() => assert.equal((restartNow as HTMLButtonElement).disabled, false));
 });
 
 const DB_SWITCH_WARNING = 'The new database starts empty.';
@@ -1741,7 +1841,7 @@ const DETAIL_PINS = {
     'DATABASE_SSL',
     'DATABASE_SSL_REJECT_UNAUTHORIZED',
   ],
-  redis: ['REDIS_BUILTIN', 'REDIS_PORT', 'REDIS_PASSWORD', 'QUEUE_ENABLED'],
+  redis: ['REDIS_BUILTIN', 'REDIS_TLS', 'REDIS_USERNAME', 'REDIS_PORT', 'REDIS_PASSWORD', 'QUEUE_ENABLED'],
   storage: ['MINIO_BUILTIN', 'S3_BUCKET', 'S3_REGION', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY'],
 };
 
@@ -1808,7 +1908,7 @@ test('every setting a save writes names its variable beside its field when the e
       dbSchemaRow: ['POSTGRES_SCHEMA'],
       dbSsl: ['DATABASE_SSL'],
       dbSslVerify: ['DATABASE_SSL_REJECT_UNAUTHORIZED'],
-      redisBuiltIn: ['REDIS_BUILTIN'],
+      redisBuiltIn: ['REDIS_BUILTIN', 'REDIS_TLS', 'REDIS_USERNAME'],
       redisRow: ['REDIS_PORT', 'REDIS_PASSWORD'],
       queue: ['QUEUE_ENABLED'],
       storageBuiltIn: ['MINIO_BUILTIN'],
@@ -2438,6 +2538,32 @@ test('a built-in Redis whose switch the environment pins is not stopped when the
   assert.deepEqual(body, { profiles: ['postgres', 'minio'], profilesToRemove: [] });
 });
 
+for (const key of ['REDIS_ENABLED', 'QUEUE_ENABLED'] as const) {
+  for (const enabled of [false, true]) {
+    test(`a pinned ${key} uses its running value ${enabled} when the saved read fails`, async () => {
+      resetFetchCalls();
+      overrides = {
+        status: {
+          ...RUNNING_BUNDLED,
+          envPinned: [key],
+          redis: { ...RUNNING_BUNDLED.redis, enabled: key === 'REDIS_ENABLED' ? enabled : false },
+          queue: { ...RUNNING_BUNDLED.queue, enabled: key === 'QUEUE_ENABLED' ? enabled : false },
+        },
+        saved: {
+          ...READBACK_SAVED,
+          redis: { ...READBACK_SAVED.redis, enabled: key === 'REDIS_ENABLED' ? !enabled : false },
+          queue: { enabled: key === 'QUEUE_ENABLED' ? !enabled : false },
+        },
+        savedAfterSaveFails: true,
+        saveProfiles: ['postgres', 'minio'],
+      };
+      const { names, body } = await saveAndRestart();
+      assert.deepEqual(names, enabled ? [] : ['openwa-redis']);
+      assert.deepEqual(body, { profiles: ['postgres', 'minio'], profilesToRemove: enabled ? [] : ['redis'] });
+    });
+  }
+}
+
 test('bundled containers the environment pins the hosts to are neither stopped nor named', async () => {
   const { screen, waitFor, fireEvent, within } = rtl;
   resetFetchCalls();
@@ -3062,7 +3188,9 @@ test('the restart progress bar measures the server estimate, not a fixed 30 s', 
   // the style drops, leaving the bar empty until the countdown fell under 30.
   await within(dialog).findByText('Server restarting... 34s', undefined, { timeout: 2_000 });
   const fill = dialog.querySelector<HTMLElement>('.restart-progress-fill');
-  assert.equal(fill?.style.width, `${(1 / 35) * 100}%`);
+  // The style serializes a number at six significant digits, as browsers do, so compare numerically.
+  const width = parseFloat(fill?.style.width ?? '');
+  assert.ok(Math.abs(width - (1 / 35) * 100) < 1e-3, `bar width ${fill?.style.width} is not 1/35 of the track`);
 });
 
 test(
@@ -3150,3 +3278,88 @@ test(
     assert.ok(within(dialog).getByText(failure), 'the failure that explains the restart is not shown');
   },
 );
+
+test('disabled database and storage are stopped beneath bundled host pins', async () => {
+  const { screen, waitFor, fireEvent, within } = rtl;
+  resetFetchCalls();
+  overrides = {
+    status: { ...RUNNING_BUNDLED, envPinned: ['DATABASE_HOST', 'S3_ENDPOINT'] },
+    saved: READBACK_SAVED,
+    savedAfterSave: {
+      ...READBACK_SAVED,
+      database: { ...READBACK_SAVED.database, type: 'sqlite', builtIn: false },
+      storage: { ...READBACK_SAVED.storage, type: 'local', builtIn: false },
+    },
+    saveProfiles: ['redis'],
+  };
+  const { container } = renderInfrastructure();
+  await screen.findByText('Database Configuration');
+  await awaitSeeded(container);
+  fireEvent.click(container.querySelectorAll<HTMLInputElement>('input[name="dbType"]')[0]);
+  fireEvent.click(container.querySelectorAll<HTMLInputElement>('input[name="storageType"]')[0]);
+  fireEvent.click(screen.getByRole('button', { name: 'Save Configuration' }));
+  const dialog = await screen.findByRole('dialog');
+  assert.deepEqual(stopNames(dialog), ['openwa-postgres', 'openwa-minio']);
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Restart Now' }));
+  await waitFor(() => assert.ok(findFetchCall('POST', '/api/infra/restart')));
+  assert.deepEqual(findFetchCall('POST', '/api/infra/restart')!.body, {
+    profiles: ['redis'],
+    profilesToRemove: ['postgres', 'minio'],
+  });
+});
+
+for (const cacheUsesRedis of [false, true]) {
+  test(`a disabled Redis beneath its bundled host pin keeps an active cache: ${cacheUsesRedis}`, async () => {
+    const { screen, waitFor, fireEvent, within } = rtl;
+    resetFetchCalls();
+    const profiles = ['postgres', 'minio', ...(cacheUsesRedis ? ['redis'] : [])];
+    overrides = {
+      status: { ...RUNNING_BUNDLED, envPinned: ['REDIS_HOST'] },
+      saved: { ...READBACK_SAVED, queue: { enabled: false } },
+      savedAfterSave: {
+        ...READBACK_SAVED,
+        redis: { ...READBACK_SAVED.redis, enabled: false },
+        queue: { enabled: false },
+      },
+      saveProfiles: profiles,
+    };
+    const { container } = renderInfrastructure();
+    await screen.findByText('Database Configuration');
+    await awaitSeeded(container);
+    fireEvent.click(toggleInput(container, 'Enable Redis'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save Configuration' }));
+    const dialog = await screen.findByRole('dialog');
+    assert.deepEqual(stopNames(dialog), cacheUsesRedis ? [] : ['openwa-redis']);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Restart Now' }));
+    await waitFor(() => assert.ok(findFetchCall('POST', '/api/infra/restart')));
+    assert.deepEqual(findFetchCall('POST', '/api/infra/restart')!.body, {
+      profiles,
+      profilesToRemove: cacheUsesRedis ? [] : ['redis'],
+    });
+  });
+}
+
+test('data backup export omits plugin secrets by default and sends includePluginSecrets=true only when opted in', async () => {
+  const { screen, waitFor, fireEvent } = rtl;
+  resetFetchCalls();
+  renderInfrastructure();
+
+  await screen.findByText('Database Configuration');
+  const checkbox = screen.getByRole('checkbox', { name: 'Include plugin instance secrets' }) as HTMLInputElement;
+  assert.equal(checkbox.checked, false, 'plugin secrets opt-in must be unchecked by default');
+
+  fireEvent.click(screen.getByRole('button', { name: 'Export data' }));
+  await waitFor(() => assert.ok(findFetchCall('GET', '/api/infra/export-data')));
+  assert.equal(findFetchCall('GET', '/api/infra/export-data?includePluginSecrets=true'), undefined);
+
+  resetFetchCalls();
+  fireEvent.click(checkbox);
+  assert.equal(checkbox.checked, true);
+  fireEvent.click(screen.getByRole('button', { name: 'Export data' }));
+  await waitFor(() =>
+    assert.ok(
+      findFetchCall('GET', '/api/infra/export-data?includePluginSecrets=true'),
+      'expected export-data?includePluginSecrets=true when opted in',
+    ),
+  );
+});

@@ -98,6 +98,104 @@ describe('sweepOrphanedFiles', () => {
     await f.sweep({ firstSeenAt: new Map(), now: 1000, chunkSize: 2, referencedAmong });
     expect(referencedAmong.mock.calls.map(([keys]) => keys.length)).toEqual([2, 2, 1]);
   });
+
+  it('stops deleting when stopped flips true and keeps unvisited firstSeenAt entries intact', async () => {
+    const f = fixture(['status/a.jpg', 'status/b.jpg']);
+    const firstSeenAt = new Map<string, number>([
+      ['status/a.jpg', 0],
+      ['status/b.jpg', 0],
+      ['status/unvisited.jpg', 0],
+    ]);
+    let stopped = false;
+    f.deleteFile.mockImplementationOnce((key: string) => {
+      f.deleted.push(key);
+      stopped = true;
+      return Promise.resolve();
+    });
+
+    const removed = await f.sweep({
+      firstSeenAt,
+      now: 1000,
+      graceMs: 500,
+      stopped: () => stopped,
+    });
+
+    expect(removed).toBe(1);
+    expect(f.deleted).toEqual(['status/a.jpg']);
+    expect(firstSeenAt.has('status/a.jpg')).toBe(false);
+    expect(firstSeenAt.get('status/b.jpg')).toBe(0);
+    expect(firstSeenAt.get('status/unvisited.jpg')).toBe(0);
+  });
+
+  it('stops before referencedAmong when stopped becomes true during enumeration', async () => {
+    let stopped = false;
+    const referencedAmong = jest.fn(() => Promise.resolve(new Set<string | undefined>()));
+    const deleteFile = jest.fn(() => Promise.resolve());
+    const firstSeenAt = new Map<string, number>([['status/existing.jpg', 100]]);
+    const storage = {
+      iterateFiles: async function* (): AsyncGenerator<string> {
+        await Promise.resolve();
+        yield 'status/first.jpg';
+        stopped = true;
+        yield 'status/second.jpg';
+      },
+      deleteFile,
+    };
+
+    const removed = await sweepOrphanedFiles({
+      storage,
+      prefix: PREFIX,
+      graceMs: 0,
+      now: 1000,
+      firstSeenAt,
+      chunkSize: 5,
+      referencedAmong,
+      onDeleteFailed: jest.fn(),
+      stopped: () => stopped,
+    });
+
+    expect(removed).toBe(0);
+    expect(referencedAmong).not.toHaveBeenCalled();
+    expect(deleteFile).not.toHaveBeenCalled();
+    expect(firstSeenAt.get('status/existing.jpg')).toBe(100);
+  });
+
+  // A session delete, or the first retention run over an old archive, can leave millions of files with no row. What
+  // makes the grace window work costs memory per file, so it is held to a ceiling and the rest waits for a later pass.
+  describe('over a backlog larger than it keeps track of', () => {
+    const TRACKED_AT_MOST = 100_000;
+    const backlog = Array.from({ length: TRACKED_AT_MOST + 5_000 }, (_, i) => `status/${i}.jpg`);
+
+    it('keeps track of no more files than the ceiling', async () => {
+      const f = fixture(backlog);
+      const firstSeenAt = new Map<string, number>();
+
+      expect(await f.sweep({ firstSeenAt, now: 1000 })).toBe(0);
+
+      expect(firstSeenAt.size).toBe(TRACKED_AT_MOST);
+    });
+
+    it('reclaims the whole backlog over later passes, each file only after the grace window', async () => {
+      const f = fixture(backlog);
+      const firstSeenAt = new Map<string, number>();
+      const relist = (): void => {
+        const gone = new Set(f.deleted);
+        f.set(backlog.filter(key => !gone.has(key)));
+      };
+
+      await f.sweep({ firstSeenAt, now: 1000 });
+      // The files seen first have run out the window; room opens as they go, so the rest are seen too.
+      expect(await f.sweep({ firstSeenAt, now: 1500 })).toBe(TRACKED_AT_MOST);
+      expect(firstSeenAt.size).toBe(5_000);
+      relist();
+
+      // These were first seen at 1500: nothing before the window has run out, then all of them.
+      expect(await f.sweep({ firstSeenAt, now: 1999 })).toBe(0);
+      expect(await f.sweep({ firstSeenAt, now: 2000 })).toBe(5_000);
+      expect(new Set(f.deleted).size).toBe(backlog.length);
+      expect(firstSeenAt.size).toBe(0);
+    });
+  });
 });
 
 /**

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Plus,
@@ -20,6 +20,8 @@ import { filterValueLabel } from '../utils/enumLabels';
 import { buildHeaderMap, generateSecret, secretError, type HeaderRow } from '../utils/webhookAuth';
 import { copyToClipboard } from '../utils/clipboard';
 import { filtersIncomplete } from '../utils/webhookFilters';
+import { isComposingKey } from '../utils/composition';
+import { isHttpMediaUrl } from '../utils/bulkMedia';
 import { useRole } from '../hooks/useRole';
 import { useToast } from '../hooks/useToast';
 import {
@@ -85,6 +87,19 @@ function FilterBadge({ filters }: { filters: WebhookFilters }) {
       left: `${Math.min(Math.max(margin, anchor.left), window.innerWidth - width - margin)}px`,
     });
   }, [anchor]);
+
+  // Escape puts the popover away without moving the pointer or focus, whether hover or focus opened it.
+  const isOpen = anchor !== null;
+  useEffect(() => {
+    if (!isOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || isComposingKey(event) || event.defaultPrevented) return;
+      event.preventDefault();
+      setAnchor(null);
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [isOpen]);
 
   return (
     <span
@@ -200,6 +215,7 @@ function SecretField({
         disabled={disabled || !value}
         onClick={async () => {
           if (await copyToClipboard(value)) toast.success(t('webhooks.auth.secretCopied'));
+          else toast.error(t('common.copyFailed'));
         }}
       >
         {t('webhooks.auth.copySecret')}
@@ -260,9 +276,22 @@ export function Webhooks() {
   const editAuthError =
     (editAuth.removeSecret ? null : secretError(editAuth.secret)) ??
     (editAuth.replaceHeaders && !editHeaders.ok ? editHeaders.error : null);
+  // The gateway takes an http(s) URL of at most 2048 code points (webhook.dto.ts). A production gateway answers anything
+  // else with a bare "Bad Request" that names no field, and a URL stored before the scheme was required fails each edit.
+  const urlError = (url: string): string | null => {
+    if (!url.trim()) return null;
+    if (/[\s<>]/.test(url) || !isHttpMediaUrl(url) || new URL(url).hostname.includes('_')) {
+      return t('webhooks.urlInvalid');
+    }
+    const count = [...url].length;
+    return count > 2048 ? t('common.fieldTooLong', { max: 2048, count }) : null;
+  };
+  const newUrlError = urlError(newWebhook.url);
+  const editUrlError = editWebhook ? urlError(editWebhook.url) : null;
   const canCreate =
     !createMutation.isPending &&
     !!newWebhook.url.trim() &&
+    !newUrlError &&
     !!newWebhook.sessionId &&
     newWebhook.events.length > 0 &&
     !filtersInvalid(newWebhook.events, newWebhook.filters) &&
@@ -271,6 +300,7 @@ export function Webhooks() {
     !!editWebhook &&
     !updateMutation.isPending &&
     !!editWebhook.url.trim() &&
+    !editUrlError &&
     editWebhook.events.length > 0 &&
     !filtersInvalid(editWebhook.events, editWebhook.filters) &&
     !editAuthError;
@@ -331,7 +361,11 @@ export function Webhooks() {
       if (result.success) {
         toast.success(t('webhooks.toasts.testOk', { status: result.statusCode }));
       } else {
-        toast.error(t('webhooks.toasts.testFailed', { message: result.error || `Status ${result.statusCode}` }));
+        toast.error(
+          t('webhooks.toasts.testFailed', {
+            message: result.error || t('webhooks.toasts.testStatus', { status: result.statusCode }),
+          }),
+        );
       }
     } catch (err) {
       toast.error(
@@ -481,6 +515,11 @@ export function Webhooks() {
             value={newWebhook.url}
             onChange={e => setNewWebhook({ ...newWebhook, url: e.target.value })}
           />
+          {newUrlError && (
+            <span className="hint error" role="status">
+              {newUrlError}
+            </span>
+          )}
           <label>{t('webhooks.events')}</label>
           <div className="event-tags">
             {availableEventNames.map(name => {
@@ -489,6 +528,7 @@ export function Webhooks() {
                 <button
                   key={name}
                   type="button"
+                  aria-pressed={isSelected}
                   className={`event-tag ${isSelected ? 'selected' : ''}`}
                   onClick={() => toggleNewEvent(name)}
                 >
@@ -514,7 +554,7 @@ export function Webhooks() {
             <span className="hint error" role="status">
               {t(
                 'webhooks.filters.incomplete',
-                'Give every filter condition a value, and use at most 20 conditions, 100 values per condition and 1000 characters of text.',
+                'Give every filter condition a value, and use at most 20 conditions, 100 values per condition, 128 characters per ID and 1000 characters of text.',
               )}
             </span>
           )}
@@ -569,6 +609,11 @@ export function Webhooks() {
             value={editWebhook.url}
             onChange={e => setEditWebhook({ ...editWebhook, url: e.target.value })}
           />
+          {editUrlError && (
+            <span className="hint error" role="status">
+              {editUrlError}
+            </span>
+          )}
           <label>{t('webhooks.events')}</label>
           <div className="event-tags">
             {availableEventNames.map(name => {
@@ -577,6 +622,7 @@ export function Webhooks() {
                 <button
                   key={name}
                   type="button"
+                  aria-pressed={isSelected}
                   className={`event-tag ${isSelected ? 'selected' : ''}`}
                   onClick={() => toggleEditEvent(name)}
                 >
@@ -602,7 +648,7 @@ export function Webhooks() {
             <span className="hint error" role="status">
               {t(
                 'webhooks.filters.incomplete',
-                'Give every filter condition a value, and use at most 20 conditions, 100 values per condition and 1000 characters of text.',
+                'Give every filter condition a value, and use at most 20 conditions, 100 values per condition, 128 characters per ID and 1000 characters of text.',
               )}
             </span>
           )}
@@ -698,7 +744,7 @@ export function Webhooks() {
               display: 'block',
               marginTop: '0.5rem',
               padding: '0.5rem',
-              background: 'var(--color-bg-secondary)',
+              background: 'var(--bg-light)',
               borderRadius: '4px',
               fontSize: '0.85rem',
               wordBreak: 'break-all',
@@ -714,13 +760,15 @@ export function Webhooks() {
           {(webhooksError || !canWrite) && webhooks.length === 0 ? (
             // A failed read is not an empty list: a key below operator is refused here (the route is
             // OPERATOR-only, so it is never sent), and a gateway error would otherwise read as "no webhooks
-            // configured". The 403 branch stays for a key whose role the page took for a writer's.
+            // configured". The 403 branch stays for a key whose role the page took for a writer's. For such a key the
+            // role copy may be wrong (a key restricted to selected chats is refused every webhook route), so it gets
+            // the gateway's own reason.
             <div className="empty-table-state" role="alert">
               <AlertCircle size={48} strokeWidth={1} />
               {!canWrite || (webhooksError as { status?: number } | null)?.status === 403 ? (
                 <>
                   <h3>{t('webhooks.empty.forbiddenTitle')}</h3>
-                  <p>{t('webhooks.empty.forbiddenDesc')}</p>
+                  <p>{canWrite ? webhooksError?.message : t('webhooks.empty.forbiddenDesc')}</p>
                 </>
               ) : (
                 <>

@@ -13,20 +13,41 @@ import {
   Min,
   Max,
   ArrayMaxSize,
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
+  Matches,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { Validate } from 'class-validator';
-import { ToStrictArray, ToStrictBoolean, ToStrictString } from '../../../common/utils/strict-boolean';
+import { ToStrictArray, ToStrictBoolean, ToStrictNumber, ToStrictString } from '../../../common/utils/strict-boolean';
 import {
   BATCH_ID_MAX_LENGTH,
   CHAT_ID_MAX_LENGTH,
+  CHAT_JID_MESSAGE,
+  CHAT_JID_PATTERN,
   MENTIONS_DESCRIPTION,
   MENTIONS_MAX,
   MENTION_WID_MAX_LENGTH,
   MESSAGE_TEXT_MAX_LENGTH,
 } from './send-message.dto';
-import { IsMentionWidConstraint } from './is-mention-wid.validator';
+import { isMentionWid } from './is-mention-wid.validator';
 import { BatchMessageStatus, BatchStatus } from '../entities/message-batch.entity';
+import { templateVariableNames } from '../../../common/utils/template-render';
+
+/**
+ * A bulk mention is a WID or a placeholder that the item's `variables` fill in, so one batch can tag a
+ * different participant per item. The rendered value is checked as a WID when the item runs.
+ */
+@ValidatorConstraint({ name: 'isBulkMentionWid', async: false })
+class IsBulkMentionWidConstraint implements ValidatorConstraintInterface {
+  validate(value: unknown): boolean {
+    return typeof value === 'string' && (isMentionWid(value) || templateVariableNames(value).length > 0);
+  }
+
+  defaultMessage(): string {
+    return 'each mentions entry must be an individual WID or contain a template placeholder';
+  }
+}
 
 class BulkMediaDto {
   @ApiPropertyOptional({ description: 'Media URL (http/https)' })
@@ -122,7 +143,7 @@ export class BulkMessageContentDto {
   @ArrayMaxSize(MENTIONS_MAX)
   @IsString({ each: true })
   @MaxLength(MENTION_WID_MAX_LENGTH, { each: true })
-  @Validate(IsMentionWidConstraint, { each: true })
+  @Validate(IsBulkMentionWidConstraint, { each: true })
   mentions?: string[];
 }
 
@@ -132,6 +153,7 @@ class BulkMessageItemDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(CHAT_ID_MAX_LENGTH)
+  @Matches(CHAT_JID_PATTERN, { message: CHAT_JID_MESSAGE })
   chatId!: string;
 
   @ApiProperty({ description: 'Message type', enum: ['text', 'image', 'video', 'audio', 'document'] })
@@ -157,6 +179,7 @@ class BulkMessageOptionsDto {
     minimum: 1000,
     maximum: 60000,
   })
+  @ToStrictNumber()
   @IsOptional()
   @IsNumber()
   @Min(1000)
@@ -199,6 +222,8 @@ export class SendBulkMessageDto {
   @ToStrictArray()
   @IsArray()
   @ArrayMaxSize(BULK_MESSAGES_MAX)
+  // @ValidateNested accepts an entry that is itself an array, and its inner items escape both the cap and the checks.
+  @IsObject({ each: true })
   @ValidateNested({ each: true })
   @Type(() => BulkMessageItemDto)
   messages!: BulkMessageItemDto[];
@@ -246,7 +271,13 @@ export class BatchProgressDto {
 }
 
 export class BatchMessageErrorDto {
-  @ApiProperty({ description: 'Machine-readable failure code.', example: 'RECIPIENT_UNREACHABLE' })
+  @ApiProperty({
+    description:
+      'Machine-readable failure code: `SEND_FAILED` when the engine refused or failed the send (a recipient WhatsApp ' +
+      'does not know included), `SEND_BLOCKED` when the media URL was refused by the SSRF guard, and ' +
+      '`SEND_PACING_LIMITED` when send pacing refused the send.',
+    example: 'SEND_FAILED',
+  })
   code!: string;
 
   @ApiProperty({ example: 'The number is not registered on WhatsApp' })
@@ -311,6 +342,11 @@ export class BatchCancelResponseDto {
   @ApiProperty({ enum: BatchStatus, example: BatchStatus.CANCELLED })
   status!: BatchStatus;
 
-  @ApiProperty({ type: BatchProgressDto })
+  @ApiProperty({
+    type: BatchProgressDto,
+    description:
+      'The counters of the last saved checkpoint. A recipient whose send is running when the batch is cancelled may ' +
+      'still be delivered, and then counts as sent in `GET batch/{batchId}`.',
+  })
   progress!: BatchProgressDto;
 }

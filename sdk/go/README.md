@@ -1,6 +1,6 @@
 # OpenWA Go SDK
 
-This document describes SDK 0.7.0. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later.
+This document describes SDK 0.14.0. Idempotency keys on `Messages.ClickButton` require OpenWA 0.32.0 or later, and `SessionStatsOverview.MemoryUsage` is `*MemoryUsage` (nil when omitted) starting in OpenWA 0.32.0. `ChatSummary.Phone` requires OpenWA 0.31.0 or later. The `linkPreview` key of a session's config requires OpenWA 0.30.3 or later. `Messages.Receipts` requires OpenWA 0.28.0 or later. `Contacts.Lid` requires OpenWA 0.27.1 or later. `Groups.SetMemberLabel`, `SearchQuery.Match`, `CustomLinkPreview.ThumbnailURL` and `CustomLinkPreview.ThumbnailBase64` require OpenWA 0.27.0 or later. Send idempotency, webhook failure redrive, message-window filters, poll choices, last-message types, and the `event.response` webhook event name require OpenWA 0.25.0 or later. The `message.receipt` and `poll.vote` webhook event names require OpenWA 0.26.0 or later.
 
 Idiomatic Go client for the [OpenWA](https://github.com/rmyndharis/OpenWA) WhatsApp
 API Gateway. Stdlib-only (no dependencies), context-first, with typed errors and
@@ -75,6 +75,9 @@ func main() {
   `WithMiddleware`, `WithTimeout`, `WithUserAgent`, `WithHeader`.
 - **Typed errors** — match with `errors.Is` against the sentinels, or unwrap the
   concrete `*APIError` with `errors.As`.
+- **Set both coordinates**: `SendLocationRequest.Latitude` and `Longitude` are
+  plain `float64`, so one left unset is sent as `0`, a real place, and the
+  gateway sends a pin there instead of refusing the request.
 
 ## Configuration
 
@@ -127,30 +130,39 @@ from the body: a few seconds when only sends still in flight caused it, the rest
 of the failure breaker's cooldown (`SEND_PACING_BREAKER_COOLDOWN_MS`, 15 minutes
 by default) after a run of send failures, otherwise up to the next UTC day.
 `APIError.Header` holds the response headers. A timeout surfaces as
-`*openwa.TimeoutError`. A 503 does not always prove a write was never carried
+`*openwa.TimeoutError`, though the gateway may still complete the request: retry
+a send only with the same `Idempotency-Key`. A 503 does not always prove a write was never carried
 out: when WhatsApp timed out, the change may still have been applied, so re-read
-the state before repeating it. A throttle on a send or a single write is the
-exception: it was turned away before it ran, so nothing was sent or applied, and
-a keyed send frees its `Idempotency-Key`. A group settings update with several
-fields applies them one at a time, so a 503 on a later field, a throttle
-included, leaves the earlier ones applied; its message lists them after
-`already applied:`, so re-read the settings before retrying, or send one field
-per request. In a routed deployment a forward that fails before reaching the
-owner node answers 503, one that fails after the request reached it answers 502
-or 504, and a 503 from the owner itself is relayed unchanged.
+the state before repeating it. A throttle on a send or a single write was turned
+away before it ran, so nothing was sent or applied; a send also sent nothing
+when its recipient lookup failed, its connection closed before the message was
+written, or its media or preview image URL could not be fetched through the
+session's proxy. Each of these frees a keyed send's `Idempotency-Key`. A group
+settings update with several fields applies them one at a time, so a 503 on a
+later field, a throttle included, leaves the earlier ones applied; its message
+lists them after `already applied:`, so re-read the settings before retrying, or
+send one field per request. In a routed deployment a forward that fails before
+reaching the owner node answers 503, one that fails after the request reached it
+answers 502 or 504, and a 503 from the owner itself is relayed unchanged.
 
 ## Retries
 
 Off by default. Opt in with a policy. Idempotent requests (GET, HEAD, OPTIONS,
 PUT, DELETE) are retried on network errors and on the policy's statuses (default
 429/500/502/503/504). A POST or PATCH (every send endpoint is a POST) is never
-retried after a network error and is retried only on 429 or 503 (when the policy
-lists them): a 500/502/504 can arrive after the message was already sent, so
-replaying it could send it twice. A 429 whose body has `code: "SEND_PACING_LIMITED"` is
+retried after a network error or a 500/502/504, which can arrive after the
+message was already sent. It is retried on 429, and on 503 only when it carries
+an `Idempotency-Key` (a send made with `WithIdempotencyKey`) or the 503 carries
+`Retry-After` (the gateway refusing a request before reading it), when the policy
+lists them. A 503 can answer a send or status post WhatsApp may already have
+delivered (on Baileys, a query it timed out with code 408): a keyed send replayed
+then gets a `409` `IDEMPOTENCY_OUTCOME_UNKNOWN` instead of a second message, while
+an unkeyed POST, including every status post (which takes no key), comes back after
+one attempt as an `*APIError` matching `ErrServiceUnavailable`. A 429 whose body has `code: "SEND_PACING_LIMITED"` is
 never retried, whatever the method: its delay is the body's `retryAfterSeconds`, which can be
 hours. Backoff is exponential, `Retry-After` is honored, and request bodies are safely rewound
 on each attempt. A 503 can be WhatsApp throttling a Baileys send, and the default backoff (three
-retries from 200ms) replays it within about a second and a half; for sends raise `BaseDelay` or lower
+retries from 200ms) replays a keyed one within about a second and a half; for sends raise `BaseDelay` or lower
 `MaxRetries`, or retry the throttled send yourself later.
 
 ```go
@@ -226,10 +238,19 @@ http.HandleFunc("/openwa/webhook", func(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	// Process delivery.Event and delivery.Data here.
+	// Route on delivery.Event and deduplicate on delivery.IdempotencyKey (headers are unsigned).
 	w.WriteHeader(http.StatusOK)
 })
 ```
+
+The signature covers the raw JSON body only (not `X-OpenWA-*` headers, which
+are unsigned) and carries no timestamp, so a captured delivery still verifies
+when it is sent again. Always deduplicate on `delivery.IdempotencyKey` and
+route on `delivery.Event` from the verified JSON payload rather than trusting
+the unsigned `X-OpenWA-Idempotency-Key` or `X-OpenWA-Event` headers: the
+gateway's own retries and an operator's redrive of a failed delivery reuse
+`delivery.IdempotencyKey`, so a key you have already handled is the same event
+arriving again.
 
 ## Security & reliability
 
@@ -242,13 +263,17 @@ http.HandleFunc("/openwa/webhook", func(w http.ResponseWriter, r *http.Request) 
   (e.g. behind a proxy at `/v1`) is preserved.
 - **Empty and dot ids are refused.** An empty, `.` or `..` id returns an error
   and nothing is sent, so a proxy that resolves dot segments cannot turn the
-  call into one on the parent resource. `Client.Do` refuses a `.` or `..`
-  segment the same way but sends an empty one (a trailing slash) as written.
+  call into one on the parent resource. So does an id with a `.` or `..` part
+  between slashes, such as `../x`: sent as `..%2Fx`, it would reach another
+  route behind a proxy that decodes `%2F` before it resolves dot segments.
+  `Client.Do` refuses a `.` or `..` segment the same way (also after an
+  encoded slash) but sends an empty one (a trailing slash) as written.
 
 ## Development
 
 ```bash
 cd sdk/go
+test -z "$(gofmt -l .)"
 go test -race -cover ./...
 go vet ./...
 ```
@@ -268,10 +293,10 @@ subdirectory rather than at the repository root:
 
 ```bash
 # Correct — `sdk/go/` prefix, matching `module github.com/rmyndharis/OpenWA/sdk/go`
-git tag sdk/go/v0.7.0 && git push origin sdk/go/v0.7.0
+git tag sdk/go/v0.14.0 && git push origin sdk/go/v0.14.0
 ```
 
-A bare `v0.7.0` tag is the _app_ version and does nothing for this module.
+A bare `v0.14.0` tag is the _app_ version and does nothing for this module.
 Without a prefixed tag, `go get` resolves a pseudo-version
 (`v0.0.0-<date>-<commit>`) — usable, but callers cannot pin a release.
 
@@ -292,11 +317,11 @@ Cutting a release:
 
 The example below requires SDK 0.6.0 or later and OpenWA 0.25.0 or later. SDK 0.5.1 does not expose this per-send key argument.
 
-Supply a unique caller-owned key for one logical send and reuse it when retrying that same call. Keys contain 1-255 visible ASCII characters; unrelated calls must use different keys. The SDK forwards the key without changing its retry policy or generating one automatically. On the twelve routes below `net/http` may still send a keyed request once more after a dropped keep-alive connection; the gateway deduplicates it, so the call returns the first answer or a `409` `IDEMPOTENCY_KEY_IN_PROGRESS` to retry later with the same key.
+Supply a unique caller-owned key for one logical send and reuse it when retrying that same call. Keys contain 1-255 visible ASCII characters; unrelated calls must use different keys. The SDK never generates a key; with `WithRetry`, the key is what lets a send answered `503` be retried (see [Retries](#retries)). On the thirteen routes below `net/http` may still send a keyed request once more after a dropped keep-alive connection; the gateway deduplicates it, so the call returns the first answer or a `409` `IDEMPOTENCY_KEY_IN_PROGRESS` to retry later with the same key.
 
 ```go
 ctx := openwa.WithIdempotencyKey(context.Background(), "order-123")
 _, err := client.Messages.SendText(ctx, sessionID, openwa.SendTextRequest{ChatID: "628123@c.us", Text: "Hello"})
 ```
 
-The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply and forward sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk, product and button operations have no such guarantee. Omit the key to preserve existing behavior.
+The gateway supports text, image, video, audio, document, sticker, location, contact, template, poll, reply, forward and `ClickButton` sends. Completed calls replay their response; a 409 with the error `code` `IDEMPOTENCY_KEY_IN_PROGRESS` means the first request is still running, so retry with the same key later; a 409 `IDEMPOTENCY_OUTCOME_UNKNOWN` means the message may have been sent, so check the chat and, if it did not arrive, send again with a new key (the `code` tells them apart from the 409 for a session that is not connected). A changed request with the same key returns 422. The gateway retains keys for 24 hours. Bulk and product operations have no such guarantee. Omit the key to preserve existing behavior.

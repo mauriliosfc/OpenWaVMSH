@@ -11,6 +11,7 @@ use GuzzleHttp\Exception\NetworkTimeoutException;
 use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\Exception\ResponseException;
 use GuzzleHttp\Exception\ResponseTimeoutException;
+use GuzzleHttp\Psr7\Request;
 use OpenWA\Exceptions\OpenWAApiException;
 use OpenWA\Exceptions\OpenWAException;
 use OpenWA\Exceptions\OpenWATimeoutException;
@@ -150,6 +151,28 @@ class HttpExecutor
     }
 
     /**
+     * Re-index the named list fields of a body that the caller may have built with array_filter() or
+     * array_unique(): json_encode writes an array whose keys are not 0 to n-1 as an object, which the gateway
+     * refuses where it takes a list. A field that is absent, null or not an array is left alone, and the caller's
+     * array is never modified, not even a list in it that the caller holds by reference.
+     *
+     * @internal Used by the resource classes; not part of the public API.
+     *
+     * @param array<string,mixed> $body
+     * @return array<string,mixed>
+     */
+    public static function lists(array $body, string ...$keys): array
+    {
+        foreach ($keys as $key) {
+            if (isset($body[$key]) && is_array($body[$key])) {
+                // A new array: assigning into $body would write through a reference the caller holds.
+                $body = array_replace($body, [$key => array_values($body[$key])]);
+            }
+        }
+        return $body;
+    }
+
+    /**
      * Perform one request and return the decoded JSON body (or null for 204).
      *
      * @param string               $method  HTTP method.
@@ -157,13 +180,24 @@ class HttpExecutor
      * @param array<string,mixed>  $query   Query parameters (null values skipped).
      * @param mixed|null           $body    JSON-serializable request body.
      *
+     * @param bool                 $allowText Return a 2xx body that is not JSON as its text. Off for the typed
+     *                                        resources, whose callers expect an array: they get an exception that
+     *                                        names the request, not a TypeError from the return type.
+     *
      * @return mixed Decoded JSON, or null for empty/204 responses.
      *
      * @throws OpenWAApiException  On any non-2xx response (typed subclass).
      * @throws OpenWATimeoutException On timeout.
+     * @throws OpenWAException On a 2xx body that is not JSON, unless $allowText.
      */
-    public function request(string $method, string $path, array $query = [], $body = null, ?string $idempotencyKey = null)
-    {
+    public function request(
+        string $method,
+        string $path,
+        array $query = [],
+        mixed $body = null,
+        ?string $idempotencyKey = null,
+        bool $allowText = false
+    ): mixed {
         $response = $this->send($method, $path, $query, $body, $idempotencyKey);
 
         $text = (string) $response->getBody();
@@ -172,7 +206,53 @@ class HttpExecutor
         }
 
         $decoded = json_decode($text, true);
-        return $decoded === null && json_last_error() !== JSON_ERROR_NONE ? $text : $decoded;
+        if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+            if (!$allowText) {
+                throw new OpenWAException("OpenWA: non-JSON response for {$method} {$path}");
+            }
+            return $text;
+        }
+        return $decoded;
+    }
+
+    /** @return array<mixed> */
+    public function requestArray(
+        string $method,
+        string $path,
+        array $query = [],
+        mixed $body = null,
+        ?string $idempotencyKey = null,
+        bool $emptyOnNull = false
+    ): array {
+        $decoded = $this->request($method, $path, $query, $body, $idempotencyKey);
+        if ($decoded === null) {
+            if ($emptyOnNull) {
+                return [];
+            }
+            throw new OpenWAException("OpenWA: expected JSON object/array response for {$method} {$path}");
+        }
+        if (!is_array($decoded)) {
+            throw new OpenWAException("OpenWA: expected JSON object/array response for {$method} {$path}");
+        }
+        return $decoded;
+    }
+
+    /** @return array<mixed>|null */
+    public function requestNullableArray(
+        string $method,
+        string $path,
+        array $query = [],
+        mixed $body = null,
+        ?string $idempotencyKey = null
+    ): ?array {
+        $decoded = $this->request($method, $path, $query, $body, $idempotencyKey);
+        if ($decoded === null) {
+            return null;
+        }
+        if (!is_array($decoded)) {
+            throw new OpenWAException("OpenWA: expected JSON object/array response for {$method} {$path}");
+        }
+        return $decoded;
     }
 
     /**
@@ -207,8 +287,13 @@ class HttpExecutor
      * @param array<string,mixed> $query
      * @param mixed|null          $body
      */
-    private function send(string $method, string $path, array $query, $body, ?string $idempotencyKey = null): ResponseInterface
-    {
+    private function send(
+        string $method,
+        string $path,
+        array $query,
+        mixed $body,
+        ?string $idempotencyKey = null
+    ): ResponseInterface {
         // Guzzle 7 upper-cased the method itself; Guzzle 8 sends it as written, and the gateway refuses "get".
         $method = strtoupper($method);
         if ($idempotencyKey !== null && preg_match('/\A[\x21-\x7E]{1,255}\z/', $idempotencyKey) !== 1) {
@@ -219,12 +304,22 @@ class HttpExecutor
         if (!str_starts_with($path, '/')) {
             throw new \InvalidArgumentException('OpenWA: path must begin with "/": ' . $path);
         }
+        $rawPath = explode('#', explode('?', $path, 2)[0], 2)[0];
+        // Decoded before it is split: a proxy that decodes %2F before it resolves dot segments reads an id sent as
+        // "..%2Fx" as "../x" and sends the call to another route.
+        foreach (explode('/', str_replace('\\', '/', rawurldecode($rawPath))) as $seg) {
+            if ($seg === '.' || $seg === '..') {
+                throw new \InvalidArgumentException('OpenWA: path must not contain a dot path segment: ' . $path);
+            }
+        }
         // Auth/JSON headers are applied per-request so they are correct whether
         // a default or injected client is used (and never leak Guzzle exceptions:
         // http_errors disabled so we translate status into typed SDK exceptions).
         $secrets = (self::$secrets ?? new \WeakMap())[$this] ?? ['apiKey' => '', 'headers' => []];
         $options = [
             'http_errors' => false,
+            // These APIs consume the whole body, so read failures must occur inside the transport catch.
+            'stream' => false,
             // Per-request options override injected Guzzle client defaults, so the SDK's configured
             // timeout is enforced consistently on both default and caller-supplied clients.
             'timeout' => $this->timeout,
@@ -256,12 +351,20 @@ class HttpExecutor
         // Build query string, skipping null values (so absent optionals aren't sent). Guzzle's
         // 'query' option would replace a query already in a raw path, so extend the URL instead.
         $url = $this->baseUrl . $path;
-        $query = array_filter($query, fn ($v) => $v !== null);
+        $query = array_map(
+            static fn (mixed $v): mixed => is_bool($v) ? ($v ? 'true' : 'false') : $v,
+            array_filter($query, static fn (mixed $v): bool => $v !== null),
+        );
         if ($query !== []) {
-            $url .= (str_contains($path, '?') ? '&' : '?') . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+            $parts = explode('#', $url, 2);
+            $url = $parts[0] . (str_contains($parts[0], '?') ? '&' : '?') . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+            if (isset($parts[1])) {
+                $url .= '#' . $parts[1];
+            }
         }
         if ($body !== null) {
-            $options['json'] = $body;
+            // json_encode writes an empty array as [], and every JSON body the gateway takes is an object.
+            $options['json'] = $body === [] ? new \stdClass() : $body;
         }
 
         $started = hrtime(true);
@@ -287,9 +390,21 @@ class HttpExecutor
         $status = $response->getStatusCode();
         // Treat any non-2xx as an error, including 3xx: redirects are deliberately not followed (so
         // the API key is never re-sent to the target), making an unfollowed 3xx unusable rather than
-        // a success. Matches the JS (`!res.ok`) and Python (`>= 300`) transports.
-        if ($status >= 300) {
+        // a success.
+        if ($status < 200 || $status >= 300) {
             throw $this->buildApiException($response, $method, $path);
+        }
+        // Guzzle 7's stream handler returns a body cut before its Content-Length as if it were whole, where cURL
+        // and Guzzle 8 raise a TransferException, so raise one too. A HEAD or 204 answer carries no body; every
+        // handler drops the Content-Length of a body it decoded (gzip), so that one is not compared either.
+        $declared = $response->getHeaderLine('Content-Length');
+        $size = $response->getBody()->getSize();
+        if ($method !== 'HEAD' && $status !== 204 && $size !== null && preg_match('/\A\d+\z/', $declared) === 1
+            && $size < (int) $declared) {
+            throw new RequestException(
+                sprintf('OpenWA: %s %s: the response ended after %d of %s bytes', $method, $path, $size, $declared),
+                new Request($method, $url)
+            );
         }
         return $response;
     }

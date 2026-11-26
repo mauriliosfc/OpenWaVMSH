@@ -40,6 +40,7 @@ export function NumberCheckProvider({ children }: { children: ReactNode }) {
 
     const results: CheckResultItem[] = [];
     let refusedWith: number | undefined;
+    let refusedCode: string | undefined;
 
     for (let i = 0; i < numbers.length; i++) {
       if (runIdRef.current !== runId) return;
@@ -73,10 +74,14 @@ export function NumberCheckProvider({ children }: { children: ReactNode }) {
 
         // The gateway keeps refusing this route for the rest of its window, a stopped session or an unreachable
         // gateway fails every later number too, so each would only become a false "Failed" row (and spend more
-        // of the limit).
-        if (isGatewayRefusal(err)) {
+        // of the limit). A 403 is the key itself being refused the route (a role, session or chat restriction),
+        // which no number changes.
+        const status = (err as { status?: number }).status;
+        if (isGatewayRefusal(err) || status === 403) {
           // A rejected fetch carries no status: the gateway never answered.
-          refusedWith = (err as { status?: number }).status ?? 0;
+          refusedWith = status ?? 0;
+          const code = (err as { code?: unknown }).code;
+          refusedCode = typeof code === 'string' ? code : undefined;
           update({ progress: { current: i + 1, total: numbers.length } });
           break;
         }
@@ -94,7 +99,9 @@ export function NumberCheckProvider({ children }: { children: ReactNode }) {
     if (runIdRef.current !== runId) return;
     runningRef.current = false;
     const stopped =
-      refusedWith === undefined ? null : { status: refusedWith, attempted: results.length, total: numbers.length };
+      refusedWith === undefined
+        ? null
+        : { status: refusedWith, code: refusedCode, attempted: results.length, total: numbers.length };
     update({ running: false, session: '', stopped });
     if (stopped) {
       toast.error(t('numberChecker.bulk.stoppedTitle'), batchStopMessage(t, stopped));

@@ -14,6 +14,7 @@ import { Template } from '../template/entities/template.entity';
 import { BaileysStoredMessage } from '../../engine/adapters/baileys-stored-message.entity';
 import { ChatState } from '../../engine/adapters/baileys-chat-state.entity';
 import { StatusUpdate } from '../status-store/entities/status-update.entity';
+import { AutomationRule } from '../automation/entities/automation-rule.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { IWhatsAppEngine, MessageResult } from '../../engine/interfaces/whatsapp-engine.interface';
 import { HookManager } from '../../core/hooks';
@@ -60,6 +61,7 @@ const entities = [
   BaileysStoredMessage,
   ChatState,
   StatusUpdate,
+  AutomationRule,
 ];
 
 describe('Session content lifetime', () => {
@@ -68,11 +70,13 @@ describe('Session content lifetime', () => {
   let engines: EngineRegistry;
   let hooks: HookManager;
   let purgeSessionData: jest.Mock;
+  let forgetBindingEpoch: jest.Mock;
   const config = new ConfigService({});
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
 
   beforeEach(async () => {
     purgeSessionData = jest.fn().mockResolvedValue(undefined);
+    forgetBindingEpoch = jest.fn();
     db = new DataSource(
       process.env.DATABASE_TYPE === 'postgres'
         ? {
@@ -122,6 +126,7 @@ describe('Session content lifetime', () => {
       operatorTeardowns: new Map(),
       reconnectStates: new Map(),
       stuckAuthRecoveryUsed: new Set(),
+      forgetBindingEpoch,
       initializingSessions: new Set(),
     } as unknown as ConstructorParameters<typeof SessionEngineControls>[0]);
   });
@@ -735,6 +740,28 @@ describe('Session content lifetime', () => {
 
       expect(await statuses()).toEqual([]);
     });
+
+    // The per-session binding epoch is keyed by the session id, which is never reused, so a committed delete has to
+    // drop it or the map grows by one entry for every session that ever saw an unlink. A refused delete leaves the
+    // session in place and keeps it.
+    it('forgets the binding epoch of a session whose delete committed', async () => {
+      const session = await createSession();
+
+      await controls.delete(session.id);
+
+      expect(forgetBindingEpoch).toHaveBeenCalledWith(session.id);
+    });
+
+    it('keeps the binding epoch of a session whose delete was refused', async () => {
+      const session = await createSession();
+      jest
+        .spyOn(SessionLifecycleFences.prototype, 'awaitPendingTeardown')
+        .mockRejectedValueOnce(new ConflictException('a logout teardown is still running'));
+
+      await expect(controls.delete(session.id)).rejects.toThrow(ConflictException);
+
+      expect(forgetBindingEpoch).not.toHaveBeenCalled();
+    });
   });
 
   // On SQLite every query runner is the one connection, and a transaction opened while another is open there
@@ -927,4 +954,41 @@ describe('Session content lifetime', () => {
       },
     );
   });
+
+  (process.env.DATABASE_TYPE === 'postgres' ? it.skip : it)(
+    'explicitly deletes automation_rules rows for the deleted session even when SQLite foreign_keys is OFF',
+    async () => {
+      const doomed = await createSession();
+      const kept = await db.getRepository(Session).save({ name: 'kept-automation', config: {} });
+      const ruleRepo = db.getRepository(AutomationRule);
+      await ruleRepo.save([
+        ruleRepo.create({
+          sessionId: doomed.id,
+          name: 'doomed-rule',
+          enabled: true,
+          conditions: { conditions: [] },
+          replyText: 'bye',
+          cooldownSeconds: 60,
+        }),
+        ruleRepo.create({
+          sessionId: kept.id,
+          name: 'kept-rule',
+          enabled: true,
+          conditions: { conditions: [] },
+          replyText: 'stay',
+          cooldownSeconds: 60,
+        }),
+      ]);
+
+      await db.query('PRAGMA foreign_keys = OFF');
+      try {
+        await controls.delete(doomed.id);
+      } finally {
+        await db.query('PRAGMA foreign_keys = ON');
+      }
+
+      expect(await ruleRepo.countBy({ sessionId: doomed.id })).toBe(0);
+      expect(await ruleRepo.countBy({ sessionId: kept.id })).toBe(1);
+    },
+  );
 });

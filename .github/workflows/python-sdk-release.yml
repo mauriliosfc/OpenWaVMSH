@@ -70,7 +70,7 @@ jobs:
           fi
           echo "Tag $REF_NAME matches pyproject.toml $PKG_VERSION"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           # One interpreter, not the SDK CI matrix: the wheel is pure Python (py3-none-any) and carries
           # requires-python from the metadata, so the build interpreter does not shape the artifact.
@@ -91,6 +91,17 @@ jobs:
         run: |
           python -m pip install --upgrade build
           python -m build
+
+      - name: Smoke-test unpacked sdist
+        working-directory: sdk/python
+        run: |
+          sdist_tmp=$(mktemp -d)
+          tar -xzf dist/*.tar.gz -C "$sdist_tmp"
+          sdist_dir=$(find "$sdist_tmp" -mindepth 1 -maxdepth 1 -type d)
+          python -m pip install --no-deps --force-reinstall "$sdist_dir"
+          (cd "$sdist_tmp" && python -c "import openwa; assert 'site-packages' in openwa.__file__, openwa.__file__; print(openwa.__file__)")
+          (cd "$sdist_dir" && pytest)
+          rm -rf "$sdist_tmp"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -116,6 +127,6 @@ jobs:
           path: sdk/python/dist/
 
       - name: Publish to PyPI (trusted publishing)
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: sdk/python/dist

@@ -88,7 +88,10 @@ if (process.env.QUEUE_ENABLED === 'true') {
           instances: { resolve: (pluginId, instanceId) => instances.resolve(pluginId, instanceId) },
           manifestRoute: (pluginId, route): IngressRouteDescriptor | undefined =>
             loader.getPlugin(pluginId)?.manifest.ingress?.find(r => r.route === route),
-          events: { recordOrSkip: input => events.recordOrSkip(input) },
+          events: {
+            recordOrSkip: input => events.recordOrSkip(input),
+            getPayloadHash: key => events.getPayloadHash(key),
+          },
           // O(1) in-memory liveness probe for the `session-alive` preflight: a Map read + a field read.
           // MUST stay cheap — never call engine.initialize() here (that is the slow/blocking path bounded
           // separately by the #667/#696 init-timeout). Undefined = no live engine (stopped/deleted).
@@ -106,8 +109,9 @@ if (process.env.QUEUE_ENABLED === 'true') {
           // The app's global throttler storage (Redis when enabled), so the bucket is shared across nodes.
           admitInstance: (pluginId, instanceId) => admitIngressInstance(throttlerStorage, pluginId, instanceId),
           // Live ingress delivery: record the dispatch outcome on the event row (so the reconciler
-          // can tell a stranded 'pending' row from one that reached the dispatch tier) and, on a
-          // swallowed inline-dispatch failure, persist a dead-letter row so RedriveService can replay
+          // can tell a stranded 'pending' row from one whose delivery settled; a queued one stays 'pending'
+          // with its payload until the worker settles it, so a job Redis loses is replayed from the row) and,
+          // on a swallowed inline-dispatch failure, persist a dead-letter row so RedriveService can replay
           // it — IngressService.handle() always 202s, so nothing else would. RedriveService calls
           // enqueue() directly (it is already replaying a DLQ row) so it never double-writes here.
           // Both writes are best-effort: a failure must not 500 the ingress request (the delivery is
